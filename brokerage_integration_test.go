@@ -449,3 +449,202 @@ func TestBrokerageChain_SettlementRecovery(t *testing.T) {
 	require.NoError(t, err)
 	assert.Len(t, lots, 1, "recovery must not duplicate the lot")
 }
+
+// fundAndBalances is a small helper for the review-case tests: creates market +
+// settlement balances and funds the client money position.
+func fundAndBalances(t *testing.T, service *Blnk, ctx context.Context, ledgerID, accountRef, currency string) (market, settlement string) {
+	t.Helper()
+	m, err := service.CreateBalance(ctx, model.Balance{LedgerID: ledgerID, Currency: currency})
+	require.NoError(t, err)
+	s, err := service.CreateBalance(ctx, model.Balance{LedgerID: ledgerID, Currency: currency})
+	require.NoError(t, err)
+	moneyPos, err := service.GetOrCreatePosition(ctx, model.PositionKey{LedgerID: ledgerID, AccountRef: accountRef, Currency: currency})
+	require.NoError(t, err)
+	_, err = service.RecordTransaction(ctx, &model.Transaction{
+		TransactionID: model.GenerateUUIDWithSuffix("txn"),
+		Source:        m.BalanceID, Destination: moneyPos.BalanceID,
+		Amount: 100000000, AmountString: "100000000", Precision: 100, Currency: currency,
+		Reference: "fund-" + accountRef, AllowOverdraft: true, SkipQueue: true,
+	})
+	require.NoError(t, err)
+	return m.BalanceID, s.BalanceID
+}
+
+// seedSettledViaBuy books a buy and settles it now, leaving `qty` settled spot.
+func seedSettledViaBuy(t *testing.T, service *Blnk, ctx context.Context, ledgerID, accountRef, instrument, venue, currency, qty, price, market, settlement string) {
+	t.Helper()
+	seed, err := service.BookTrade(ctx, model.TradeBooking{
+		LedgerID: ledgerID, AccountRef: accountRef, Instrument: instrument, Venue: venue, Currency: currency,
+		Quantity: qty, QuantityPrecision: 1, Price: price, MoneyPrecision: 100,
+		SettleOffset: 2, SettlementBalanceID: settlement, MarketBalanceID: market,
+		Reference: "seed-" + accountRef, TradeDate: time.Now().AddDate(0, 0, -5),
+	})
+	require.NoError(t, err)
+	_, err = service.SettleTrade(ctx, seed.SecurityTxnID)
+	require.NoError(t, err)
+}
+
+// TestBrokerageReview_OnTheWayExplicitSettleDateSell: on-the-way instrument,
+// buy 50 with an explicit settle_date, then sell 125 at spot 100 must pass
+// (the explicit-settle_date incoming is counted).
+func TestBrokerageReview_OnTheWayExplicitSettleDateSell(t *testing.T) {
+	service := newIntegrationBlnk(t)
+	ctx := context.Background()
+	ledgerID := mustCreateLedger(t, service)
+	const (
+		accountRef = "rev-otw-exp"
+		instrument = "AAPL"
+		venue      = "NASDAQ"
+		currency   = "USD"
+	)
+	_, err := service.SetInstrumentSettings(ctx, model.InstrumentSettings{
+		Instrument: instrument, Venue: venue, TradesOnTheWay: true, SettleOffset: 2,
+	})
+	require.NoError(t, err)
+	market, settlement := fundAndBalances(t, service, ctx, ledgerID, accountRef, currency)
+	seedSettledViaBuy(t, service, ctx, ledgerID, accountRef, instrument, venue, currency, "100", "150.00", market, settlement)
+
+	// Buy 50 with an EXPLICIT settle date (settle_code NULL).
+	explicit := time.Date(2026, 7, 20, 0, 0, 0, 0, time.UTC)
+	_, err = service.BookTrade(ctx, model.TradeBooking{
+		LedgerID: ledgerID, AccountRef: accountRef, Instrument: instrument, Venue: venue, Currency: currency,
+		Quantity: "50", QuantityPrecision: 1, Price: "180.00", MoneyPrecision: 100,
+		SettleDate: explicit, SettlementBalanceID: settlement, MarketBalanceID: market,
+		Reference: "buy-exp-50",
+	})
+	require.NoError(t, err)
+
+	// Sell 125 with the same explicit settle date: 100 settled + 50 incoming = 150 >= 125.
+	sell, err := service.SellTrade(ctx, model.SellBooking{
+		LedgerID: ledgerID, AccountRef: accountRef, Instrument: instrument, Venue: venue, Currency: currency,
+		Quantity: "125", QuantityPrecision: 1, Price: "185.00", MoneyPrecision: 100,
+		SettleDate: explicit, SettlementBalanceID: settlement, MarketBalanceID: market,
+		Reference: "sell-exp-125",
+	})
+	require.NoError(t, err)
+	assert.Equal(t, int64(150), sell.Tradable.Tradable.Int64())
+	assert.Equal(t, int64(50), sell.Tradable.Incoming.Int64(), "explicit-settle_date buy counted as incoming")
+}
+
+// TestBrokerageReview_ExplicitSellTwiceSeesOutgoing: two explicit-settle_date
+// sells in a row; the second must see the first as outgoing.
+func TestBrokerageReview_ExplicitSellTwiceSeesOutgoing(t *testing.T) {
+	service := newIntegrationBlnk(t)
+	ctx := context.Background()
+	ledgerID := mustCreateLedger(t, service)
+	const (
+		accountRef = "rev-exp-twice"
+		instrument = "AAPL"
+		venue      = "NASDAQ"
+		currency   = "USD"
+	)
+	_, err := service.SetInstrumentSettings(ctx, model.InstrumentSettings{
+		Instrument: instrument, Venue: venue, TradesOnTheWay: true, SettleOffset: 2,
+	})
+	require.NoError(t, err)
+	market, settlement := fundAndBalances(t, service, ctx, ledgerID, accountRef, currency)
+	seedSettledViaBuy(t, service, ctx, ledgerID, accountRef, instrument, venue, currency, "100", "150.00", market, settlement)
+
+	explicit := time.Date(2026, 7, 21, 0, 0, 0, 0, time.UTC)
+	sellOnce := func(ref, qty string) error {
+		_, e := service.SellTrade(ctx, model.SellBooking{
+			LedgerID: ledgerID, AccountRef: accountRef, Instrument: instrument, Venue: venue, Currency: currency,
+			Quantity: qty, QuantityPrecision: 1, Price: "185.00", MoneyPrecision: 100,
+			SettleDate: explicit, SettlementBalanceID: settlement, MarketBalanceID: market,
+			Reference: ref,
+		})
+		return e
+	}
+	require.NoError(t, sellOnce("exp-sell-60a", "60")) // 100 -> 40 left
+	// Second sell of 60 must now be rejected (only 40 left after outgoing 60).
+	assert.Error(t, sellOnce("exp-sell-60b", "60"), "second explicit sell must see the first as outgoing")
+	// But a sell of 40 is fine.
+	require.NoError(t, sellOnce("exp-sell-40", "40"))
+}
+
+// TestBrokerageReview_ImmediateNoDoubleSell: the core item-2 fix. An
+// immediate-settlement instrument must not allow overselling: sell 80 at spot
+// 100 passes, a second sell 80 is rejected (outgoing is subtracted).
+func TestBrokerageReview_ImmediateNoDoubleSell(t *testing.T) {
+	service := newIntegrationBlnk(t)
+	ctx := context.Background()
+	ledgerID := mustCreateLedger(t, service)
+	const (
+		accountRef = "rev-immediate"
+		instrument = "MSFT"
+		venue      = "NASDAQ"
+		currency   = "USD"
+	)
+	// Immediate-settlement (trades_on_the_way = false). Seed needs T+N to settle,
+	// so seed first, then mark immediate.
+	_, err := service.SetInstrumentSettings(ctx, model.InstrumentSettings{
+		Instrument: instrument, Venue: venue, TradesOnTheWay: true, SettleOffset: 2,
+	})
+	require.NoError(t, err)
+	market, settlement := fundAndBalances(t, service, ctx, ledgerID, accountRef, currency)
+	seedSettledViaBuy(t, service, ctx, ledgerID, accountRef, instrument, venue, currency, "100", "200.00", market, settlement)
+	_, err = service.SetInstrumentSettings(ctx, model.InstrumentSettings{
+		Instrument: instrument, Venue: venue, TradesOnTheWay: false, SettleOffset: 0,
+	})
+	require.NoError(t, err)
+
+	sellOnce := func(ref, qty string) error {
+		_, e := service.SellTrade(ctx, model.SellBooking{
+			LedgerID: ledgerID, AccountRef: accountRef, Instrument: instrument, Venue: venue, Currency: currency,
+			Quantity: qty, QuantityPrecision: 1, Price: "205.00", MoneyPrecision: 100,
+			SettlementBalanceID: settlement, MarketBalanceID: market, Reference: ref,
+		})
+		return e
+	}
+	require.NoError(t, sellOnce("imm-sell-80a", "80"), "first immediate sell of 80 should pass")
+	assert.Error(t, sellOnce("imm-sell-80b", "80"), "second immediate sell of 80 must be rejected (no overselling)")
+	// A sell of the remaining 20 is fine.
+	require.NoError(t, sellOnce("imm-sell-20", "20"))
+}
+
+// TestBrokerageReview_NoSettingsSettleOffset locks the chosen semantics for an
+// instrument without settings booked with an offset: it is NOT on-the-way
+// (incoming not counted), but outgoing still reduces availability, so it cannot
+// be oversold.
+func TestBrokerageReview_NoSettingsSettleOffset(t *testing.T) {
+	service := newIntegrationBlnk(t)
+	ctx := context.Background()
+	ledgerID := mustCreateLedger(t, service)
+	const (
+		accountRef = "rev-nosettings"
+		instrument = "NOSETZZ" // no instrument_settings row (unique to this test)
+		venue      = "NASDAQ"
+		currency   = "USD"
+	)
+	market, settlement := fundAndBalances(t, service, ctx, ledgerID, accountRef, currency)
+	// Seed 100 settled by booking T+2 and settling (no settings -> offset honored).
+	seedSettledViaBuy(t, service, ctx, ledgerID, accountRef, instrument, venue, currency, "100", "100.00", market, settlement)
+
+	// Buy 50 more T+2: with no settings this is NOT counted as incoming.
+	buy, err := service.BookTrade(ctx, model.TradeBooking{
+		LedgerID: ledgerID, AccountRef: accountRef, Instrument: instrument, Venue: venue, Currency: currency,
+		Quantity: "50", QuantityPrecision: 1, Price: "100.00", MoneyPrecision: 100,
+		SettleOffset: 2, SettlementBalanceID: settlement, MarketBalanceID: market, Reference: "ns-buy-50",
+	})
+	require.NoError(t, err)
+
+	// Tradable must NOT lend against the in-transit 50: only settled 100.
+	tradable, err := service.GetTradablePosition(ctx, ledgerID, "", accountRef, instrument, currency, buy.SettleDate)
+	require.NoError(t, err)
+	assert.False(t, tradable.OnTheWay)
+	assert.Equal(t, int64(0), tradable.Incoming.Int64(), "no-settings: incoming not counted")
+	assert.Equal(t, int64(100), tradable.Tradable.Int64())
+
+	// Selling 125 must be rejected (only 100 available); selling 100 then 1 more rejected.
+	sell := func(ref, qty string, offset int) error {
+		_, e := service.SellTrade(ctx, model.SellBooking{
+			LedgerID: ledgerID, AccountRef: accountRef, Instrument: instrument, Venue: venue, Currency: currency,
+			Quantity: qty, QuantityPrecision: 1, Price: "100.00", MoneyPrecision: 100,
+			SettleOffset: offset, SettlementBalanceID: settlement, MarketBalanceID: market, Reference: ref,
+		})
+		return e
+	}
+	assert.Error(t, sell("ns-sell-125", "125", 2), "no-settings must not lend against incoming")
+	require.NoError(t, sell("ns-sell-100", "100", 2))
+	assert.Error(t, sell("ns-sell-1", "1", 2), "outgoing must reduce availability for no-settings too")
+}

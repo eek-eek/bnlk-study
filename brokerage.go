@@ -125,17 +125,20 @@ type tradeParams struct {
 	venue        string
 }
 
-// resolveTradeParams resolves the trading mode for an instrument. Configured
-// instrument settings win; otherwise the instrument is treated as
-// immediate-settlement (not on-the-way) and the caller-supplied offset/venue
-// are used. Crucially, an instrument with no "trades on the way" flag never
-// counts in-transit quantity as tradable — exactly the requested behavior.
+// resolveTradeParams resolves the trading mode for an instrument.
+//
+// Semantics:
+//   - Configured settings win: an on-the-way instrument keeps its T+N offset; a
+//     non-on-the-way one is forced to T+0.
+//   - No settings: the instrument is NOT on-the-way (availability never lends
+//     against in-transit incoming purchases), but the caller-supplied offset is
+//     still honored so the trade settles on its requested/explicit date. This
+//     is safe because outgoing holds always reduce availability (see
+//     ComputeTradable), so it cannot be oversold regardless of the offset.
 func (l *Blnk) resolveTradeParams(ctx context.Context, instrument string, requestedOffset int, requestedVenue string) (tradeParams, error) {
 	settings, err := l.datasource.GetInstrumentSettings(ctx, instrument)
 	if err != nil {
 		if apiErr, ok := err.(apierror.APIError); ok && apiErr.Code == apierror.ErrNotFound {
-			// No settings: immediate-settlement instrument. Future
-			// incoming/outgoing must not be counted as tradable.
 			return tradeParams{onTheWay: false, settleOffset: requestedOffset, venue: requestedVenue}, nil
 		}
 		return tradeParams{}, err
@@ -200,19 +203,23 @@ func (l *Blnk) GetTradablePosition(ctx context.Context, ledgerID, identityID, ac
 		return nil, err
 	}
 
-	incoming := big.NewInt(0)
-	outgoing := big.NewInt(0)
+	// Always fetch holds: outgoing (already-committed sells) must reduce
+	// availability even for immediate-settlement instruments, otherwise a
+	// second sell of the same settled position would be allowed. Incoming is
+	// only counted (added) for on-the-way instruments — see ComputeTradable.
+	incoming, outgoing, err := l.datasource.SumFutureHolds(ctx, ledgerID, identityID, accountRef, instrument, currency, asOfSettleDate)
+	if err != nil {
+		return nil, err
+	}
+	reportedIncoming := big.NewInt(0)
 	if onTheWay {
-		incoming, outgoing, err = l.datasource.SumFutureHolds(ctx, ledgerID, identityID, accountRef, instrument, currency, asOfSettleDate)
-		if err != nil {
-			return nil, err
-		}
+		reportedIncoming = incoming
 	}
 
 	return &model.TradablePosition{
 		Settled:    settled,
 		Blocked:    blocked,
-		Incoming:   incoming,
+		Incoming:   reportedIncoming,
 		Outgoing:   outgoing,
 		Tradable:   model.ComputeTradable(settled, blocked, incoming, outgoing, onTheWay),
 		OnTheWay:   onTheWay,

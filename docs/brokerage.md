@@ -44,16 +44,18 @@
 
 ```
 on-the-way:  tradable = settled - blocked + incoming(≤ settle_date) - outgoing(≤ settle_date)
-immediate:   tradable = settled - blocked            # будущие приход/расход НЕ учитываются
+immediate:   tradable = settled - blocked - outgoing(≤ settle_date)
 ```
 
 - `settled` — спот-остаток; `blocked` — inflight-дебет на споте;
 - `incoming`/`outgoing` — суммарный inflight-кредит/дебет на future-балансах,
   созревающих не позже даты расчёта продажи (`SumFutureHolds`).
 
-Если на инструменте нет настроек или флаг выключен — это
-immediate-settlement: продать можно только расчётный остаток, приход/расход
-в пути игнорируются (`ComputeTradable(..., onTheWay=false)`).
+Если на инструменте нет настроек или флаг выключен — это immediate-settlement:
+**incoming в пути НЕ учитывается** (нельзя «занимать» под будущие покупки), но
+**outgoing вычитается всегда** — уже обещанная поставка уменьшает доступное,
+иначе вторая продажа той же позиции прошла бы повторно
+(`ComputeTradable(..., onTheWay=false)`).
 
 `SellTrade` сначала проверяет `GetTradablePosition` на дату расчёта продажи и
 отклоняет сделку при нехватке, затем книжит леги: бумаги — inflight-дебет с

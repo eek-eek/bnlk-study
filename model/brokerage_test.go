@@ -284,6 +284,14 @@ func TestComputeTradable_Scenario(t *testing.T) {
 		tradable := ComputeTradable(big.NewInt(100), big.NewInt(30), nil, nil, false)
 		assert.Equal(t, int64(70), tradable.Int64())
 	})
+
+	t.Run("immediate instrument still subtracts outgoing", func(t *testing.T) {
+		// 100 settled, an 80 sell already committed (outgoing), incoming 50 ignored:
+		// 100 - 0 - 80 = 20. A second sell of 80 must be rejected.
+		tradable := ComputeTradable(big.NewInt(100), big.NewInt(0), big.NewInt(50), big.NewInt(80), false)
+		assert.Equal(t, int64(20), tradable.Int64())
+		assert.True(t, tradable.Cmp(big.NewInt(80)) < 0)
+	})
 }
 
 func TestPreciseQuantityAndMoney(t *testing.T) {

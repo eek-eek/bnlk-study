@@ -73,8 +73,11 @@
 5. **Маппинг inflight ↔ доменные понятия:**
    - `inflight_debit_balance` = **блокировка** (`blockedAmount` в TradeControl);
    - `inflight_credit_balance` = **приход «в пути»** (`waitingAmount`).
-6. **Доступно к продаже** считается с учётом даты расчёта **только** для
-   инструментов с `trades_on_the_way = true`; иначе — только settled − blocked.
+6. **Доступно к продаже** (`ComputeTradable`): `outgoing` (уже обещанные
+   поставки в future-bucket'ах) **вычитается всегда** — иначе вторая продажа
+   той же позиции прошла бы повторно (в т.ч. для immediate). `incoming`
+   (покупки в пути) **добавляется только** при `trades_on_the_way = true`.
+   `GetTradablePosition` всегда зовёт `SumFutureHolds`.
 7. **WA-цена** обновляется на **расчёте покупки** (не на букинге); продажа по WA
    среднюю не меняет. Округление HALF_EVEN, scale 2, арифметика на `decimal`.
 8. **Расчёт = net-roll:** будущая позиция нетится (`balance = credit − debit`),

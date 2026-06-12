@@ -163,8 +163,9 @@ immediate-settlement: будущие приход/расход **не** учит
 
 ```
 on-the-way:  tradable = settled − blocked + incoming(≤ дата расчёта) − outgoing(≤ дата расчёта)
-immediate:   tradable = settled − blocked
-                       (будущие приход/расход НЕ учитываются)
+immediate:   tradable = settled − blocked − outgoing(≤ дата расчёта)
+                       (incoming НЕ добавляется; outgoing вычитается всегда —
+                        иначе вторая продажа той же позиции прошла бы повторно)
 отрицательный результат отсекается до 0.
 ```
 

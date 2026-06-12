@@ -225,7 +225,7 @@ func TestGetTradablePosition_OnTheWayCountsIncoming(t *testing.T) {
 	assert.Equal(t, int64(150), tradable.Tradable.Int64())
 }
 
-func TestGetTradablePosition_ImmediateIgnoresIncoming(t *testing.T) {
+func TestGetTradablePosition_ImmediateIgnoresIncomingButSubtractsOutgoing(t *testing.T) {
 	service, datasource, cleanup := newBrokerageTestBlnk(t)
 	defer cleanup()
 
@@ -235,15 +235,19 @@ func TestGetTradablePosition_ImmediateIgnoresIncoming(t *testing.T) {
 	datasource.On("GetPosition", mock.Anything, mock.Anything).Return(&model.Balance{
 		BalanceID: "bln_spot", Balance: big.NewInt(100), InflightDebitBalance: big.NewInt(0),
 	}, nil)
-	// SumFutureHolds must NOT be consulted for an immediate-settlement instrument.
+	// In transit: 50 incoming (a buy) and 30 outgoing (a prior committed sell).
+	datasource.On("SumFutureHolds", mock.Anything, "ldg", "idn", "acc", "MSFT", "USD", mock.Anything).
+		Return(big.NewInt(50), big.NewInt(30), nil)
 
 	asOf := time.Date(2026, 6, 16, 0, 0, 0, 0, time.UTC)
 	tradable, err := service.GetTradablePosition(context.Background(), "ldg", "idn", "acc", "MSFT", "USD", asOf)
 	assert.NoError(t, err)
 	assert.False(t, tradable.OnTheWay)
-	// Only the settled 100 is tradable; the future 50 is ignored.
-	assert.Equal(t, int64(100), tradable.Tradable.Int64())
-	datasource.AssertNotCalled(t, "SumFutureHolds", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything)
+	// Incoming 50 is NOT added (immediate), but outgoing 30 IS subtracted:
+	// 100 - 0 - 30 = 70. The reported incoming is 0 (not counted).
+	assert.Equal(t, int64(70), tradable.Tradable.Int64())
+	assert.Equal(t, int64(0), tradable.Incoming.Int64())
+	assert.Equal(t, int64(30), tradable.Outgoing.Int64())
 }
 
 func TestSellTrade_RejectsWhenImmediateInstrumentLacksSettled(t *testing.T) {
@@ -256,6 +260,8 @@ func TestSellTrade_RejectsWhenImmediateInstrumentLacksSettled(t *testing.T) {
 	datasource.On("GetPosition", mock.Anything, mock.Anything).Return(&model.Balance{
 		BalanceID: "bln_spot", Balance: big.NewInt(100), InflightDebitBalance: big.NewInt(0),
 	}, nil)
+	datasource.On("SumFutureHolds", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+		Return(big.NewInt(0), big.NewInt(0), nil)
 
 	_, err := service.SellTrade(context.Background(), model.SellBooking{
 		LedgerID: "ldg", IdentityID: "idn", AccountRef: "acc",

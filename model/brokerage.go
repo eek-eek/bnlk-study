@@ -257,14 +257,19 @@ type TradablePosition struct {
 // ComputeTradable applies the TradeControl settle-date arithmetic:
 //
 //	on-the-way:  tradable = settled - blocked + incoming - outgoing
-//	immediate:   tradable = settled - blocked
+//	immediate:   tradable = settled - blocked - outgoing
 //
+// Outgoing (already-committed sells held in future buckets) is ALWAYS
+// subtracted, including for immediate-settlement instruments: a delivery you
+// have already committed reduces what is still sellable regardless of whether
+// the instrument trades on the way. Incoming (in-transit purchases) is only
+// added for on-the-way instruments — that is the part you may "lend against".
 // A negative result is clamped to zero.
 func ComputeTradable(settled, blocked, incoming, outgoing *big.Int, onTheWay bool) *big.Int {
 	tradable := new(big.Int).Sub(nz(settled), nz(blocked))
+	tradable.Sub(tradable, nz(outgoing))
 	if onTheWay {
 		tradable.Add(tradable, nz(incoming))
-		tradable.Sub(tradable, nz(outgoing))
 	}
 	if tradable.Sign() < 0 {
 		return big.NewInt(0)

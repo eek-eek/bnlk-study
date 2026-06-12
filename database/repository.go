@@ -38,6 +38,7 @@ type IDataSource interface {
 	apikey         // Interface for API key operations
 	lineage        // Interface for fund lineage operations
 	chain          // Interface for hash-chain operations
+	brokerage      // Interface for brokerage balance operations
 }
 
 // transaction defines methods for handling transactions.
@@ -193,6 +194,25 @@ type lineage interface {
 	MarkOutboxFailed(ctx context.Context, id int64, errMsg string) error                                                     // Marks an outbox entry as failed
 	GetOutboxByTransactionID(ctx context.Context, transactionID string) (*model.LineageOutbox, error)                        // Gets outbox entry by transaction ID
 	HasPendingCreditOutbox(ctx context.Context, balanceID string) (bool, error)                                              // Checks if there are pending credit outbox entries for a balance
+}
+
+// brokerage defines the brokerage balance operations: settle-aware position
+// balances, atomic multi-key mutations, purchase lots and venue holidays
+// (TradeControl balance subsystem port).
+type brokerage interface {
+	GetPosition(ctx context.Context, key model.PositionKey) (*model.Balance, error)                                                                  // Retrieves a position balance by exact key
+	GetPositionByID(ctx context.Context, balanceID string) (*model.Balance, error)                                                                   // Retrieves a balance by ID with brokerage columns
+	FindOrCreatePosition(ctx context.Context, key model.PositionKey, settleDate *time.Time) (*model.Balance, error)                                  // Retrieves or creates a position balance
+	GetActivePosition(ctx context.Context, ledgerID, identityID, accountRef, instrument, currency string, maxSettleCode *int) (*model.Balance, error) // Resolves the active balance via the settle cascade (T+N -> ... -> spot)
+	GetMaturedPositions(ctx context.Context, asOf time.Time, limit int) ([]*model.Balance, error)                                                    // Lists future balances whose settle date has been reached
+	ApplyBalanceDeltas(ctx context.Context, deltas []model.BalanceDelta) error                                                                       // Applies a normalized mutation plan atomically
+	RecomputeHolds(ctx context.Context, balanceID string) (*big.Int, *big.Int, error)                                                                // Rebuilds blocked/waiting holds from live INFLIGHT transactions
+	GetPendingInflightByDestination(ctx context.Context, balanceID string) ([]*model.Transaction, error)                                             // Lists pending inflight transactions destined to a balance
+	UpdateWAPrice(ctx context.Context, balanceID, waPrice string) error                                                                              // Stores the weighted-average price
+	CreateLot(ctx context.Context, lot model.BalanceLot) (model.BalanceLot, error)                                                                   // Records a purchase lot
+	GetLots(ctx context.Context, balanceID string) ([]model.BalanceLot, error)                                                                       // Lists purchase lots of a balance
+	CreateHoliday(ctx context.Context, holiday model.MarketHoliday) (model.MarketHoliday, error)                                                     // Registers a venue holiday
+	GetHolidays(ctx context.Context, venue string, from, to time.Time) ([]model.MarketHoliday, error)                                                // Lists venue holidays in a range
 }
 
 // chain defines the hash-chain (tamper-evidence) operations.

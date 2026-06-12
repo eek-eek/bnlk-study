@@ -17,7 +17,7 @@
 | `Balance(subject, account, ticker, currency, settle)` | `balances` + новые колонки `instrument`, `settle_date`, `settle_code` | `instrument IS NULL` ⇒ денежный баланс — инвариант TradeControl сохранён |
 | `amount` (свободный остаток) | `balance` (= `credit_balance - debit_balance`) | нативное поле Blnk |
 | `blockedAmount` | `inflight_debit_balance` | блокировка = незакоммиченный inflight-дебет (hold) |
-| `waitingAmount` («в пути») | `queued_credit_balance` + `inflight_credit_balance` | будущие зачисления |
+| `waitingAmount` («в пути») | `inflight_credit_balance` | будущие зачисления = незакоммиченный inflight-кредит (queued_* в blnk считаются на лету и не хранятся) |
 | `waPrice` | `wa_price` (новая колонка) | пересчёт по формуле TC, HALF_EVEN, scale 2 |
 | `BalanceDetail` (лоты покупок) | таблица `balance_lots` | qty, price, purchased_at |
 | `Holiday` / `HolidayService` | таблица `market_holidays` + `ComputeSettleDate` | выходные + праздники площадки не считаются расчётными днями |
@@ -56,17 +56,22 @@
 ## 3. Жизненный цикл сделки (buy, T+N)
 
 ```
-BookTrade:
+BookTrade (POST /brokerage/trades):
   1. settleDate = ComputeSettleDate(venue, tradeDate, N)        # праздники учтены
   2. money-лег:  INFLIGHT debit  client_money → settlement      # blocked ↑
   3. security-лег: INFLIGHT credit market → client_sec(T+N)     # waiting ↑ на future-балансе
-     (future-баланс создаётся на лету — как createClearBalanceForRecalculate)
+     (future-баланс создаётся на лету — как createClearBalanceForRecalculate;
+      при сбое security-лега money-лег компенсируется VOID'ом)
 
-RunSettlement (по settle_date <= today):
+SettleTrade (POST /brokerage/trades/:txID/settle) / RunSettlement:
   4. commit money-лега (inflight → applied)                     # blocked ↓, деньги списаны
   5. commit security-лега                                       # waiting ↓, бумаги зачислены
   6. перенос future → spot: обычная двойная запись T+N → T+0
-  7. пересчёт WA price + создание лота
+  7. пересчёт WA price + создание лота (на settlement, а не на букинге:
+     отменённый трейд не искажает WA — осознанное отличие от TC)
+
+RunSettlement дополнительно: crash-recovery — закоммиченный, но не
+перенесённый остаток на созревшем future-балансе докатывается до spot.
 ```
 
 ## 4. WA price (средневзвешенная цена)
@@ -104,14 +109,15 @@ errorMessage, currency)`.
 - `BalanceKey = (ledger, identity, account_ref, instrument, currency,
   settle_code)`; `LockKey()` — pipe-join.
 - `BalanceDelta = (key, amountDelta, blockedDelta, waitingDelta)` c `Merge()`
-  и `IsNoOp()`; `MutationPlan.Normalized()` сливает дельты по ключу,
-  `OrderedKeys()` сортирует — защита от deadlock.
+  и `IsNoOp()`; `MutationPlan.Normalized()` сливает дельты по ключу и
+  сортирует по lock key — защита от deadlock.
 - `ApplyMutationPlan`:
   1. Redis-локи по всем ключам в отсортированном порядке;
   2. `SELECT … FOR UPDATE` (find-or-create недостающих балансов);
   3. batch update дельт с сохранением инвариантов Blnk
      (`amountDelta>0 → credit_balance`, `<0 → debit_balance`;
-     `blocked → inflight_debit`; `waiting → queued_credit`);
+     `blocked → inflight_debit`; `waiting → inflight_credit`;
+     уход холдов в минус отклоняется);
   4. снятие локов после коммита/отката.
 - Это **escape hatch** для пересчётов/реконсиляции — штатные движения денег
   должны идти через транзакции Blnk (как и в TC: «прямые save в обход локов
@@ -134,6 +140,7 @@ errorMessage, currency)`.
 | POST | `/brokerage/positions` | find-or-create позиционного баланса по ключу |
 | GET | `/brokerage/positions/active` | каскадный поиск активного баланса (T+N→…→spot) |
 | POST | `/brokerage/trades` | букинг сделки (hold денег + future-позиция) |
+| POST | `/brokerage/trades/:txID/settle` | расчёт одной сделки по security-легу |
 | POST | `/brokerage/settlements/run` | ролл созревших future-балансов + коммит холдов |
 | POST | `/brokerage/mutations` | применить MutationPlan |
 | POST | `/brokerage/balances/recalculate-holds` | пересчёт blocked/waiting из истории |

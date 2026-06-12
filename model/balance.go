@@ -44,6 +44,16 @@ type Balance struct {
 	MetaData              map[string]interface{} `json:"meta_data"`
 	TrackFundLineage      bool                   `json:"track_fund_lineage"`
 	AllocationStrategy    string                 `json:"allocation_strategy,omitempty"`
+
+	// Brokerage extension fields. Populated only for brokerage-managed
+	// balances (AccountRef != ""); empty/nil for native blnk balances.
+	// A balance with Instrument == "" is a money balance, otherwise it is a
+	// securities position (TradeControl: "ticker == null => money balance").
+	AccountRef string     `json:"account_ref,omitempty"`
+	Instrument string     `json:"instrument,omitempty"`
+	SettleDate *time.Time `json:"settle_date,omitempty"`
+	SettleCode *int       `json:"settle_code,omitempty"`
+	WAPrice    string     `json:"wa_price,omitempty"`
 }
 
 type BalanceMonitor struct {

@@ -701,3 +701,97 @@ func (m *MockDataSource) CountUnchainedTransactions(ctx context.Context, cutoff 
 	args := m.Called(ctx, cutoff)
 	return args.Get(0).(int64), args.Error(1)
 }
+
+// --- Brokerage operations ---
+
+func (m *MockDataSource) GetPosition(ctx context.Context, key model.PositionKey) (*model.Balance, error) {
+	args := m.Called(ctx, key)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).(*model.Balance), args.Error(1)
+}
+
+func (m *MockDataSource) GetPositionByID(ctx context.Context, balanceID string) (*model.Balance, error) {
+	args := m.Called(ctx, balanceID)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).(*model.Balance), args.Error(1)
+}
+
+func (m *MockDataSource) FindOrCreatePosition(ctx context.Context, key model.PositionKey, settleDate *time.Time) (*model.Balance, error) {
+	args := m.Called(ctx, key, settleDate)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).(*model.Balance), args.Error(1)
+}
+
+func (m *MockDataSource) GetActivePosition(ctx context.Context, ledgerID, identityID, accountRef, instrument, currency string, maxSettleCode *int) (*model.Balance, error) {
+	args := m.Called(ctx, ledgerID, identityID, accountRef, instrument, currency, maxSettleCode)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).(*model.Balance), args.Error(1)
+}
+
+func (m *MockDataSource) GetMaturedPositions(ctx context.Context, asOf time.Time, limit int) ([]*model.Balance, error) {
+	args := m.Called(ctx, asOf, limit)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).([]*model.Balance), args.Error(1)
+}
+
+func (m *MockDataSource) ApplyBalanceDeltas(ctx context.Context, deltas []model.BalanceDelta) error {
+	args := m.Called(ctx, deltas)
+	return args.Error(0)
+}
+
+func (m *MockDataSource) RecomputeHolds(ctx context.Context, balanceID string) (*big.Int, *big.Int, error) {
+	args := m.Called(ctx, balanceID)
+	if args.Get(0) == nil {
+		return nil, nil, args.Error(2)
+	}
+	return args.Get(0).(*big.Int), args.Get(1).(*big.Int), args.Error(2)
+}
+
+func (m *MockDataSource) GetPendingInflightByDestination(ctx context.Context, balanceID string) ([]*model.Transaction, error) {
+	args := m.Called(ctx, balanceID)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).([]*model.Transaction), args.Error(1)
+}
+
+func (m *MockDataSource) UpdateWAPrice(ctx context.Context, balanceID, waPrice string) error {
+	args := m.Called(ctx, balanceID, waPrice)
+	return args.Error(0)
+}
+
+func (m *MockDataSource) CreateLot(ctx context.Context, lot model.BalanceLot) (model.BalanceLot, error) {
+	args := m.Called(ctx, lot)
+	return args.Get(0).(model.BalanceLot), args.Error(1)
+}
+
+func (m *MockDataSource) GetLots(ctx context.Context, balanceID string) ([]model.BalanceLot, error) {
+	args := m.Called(ctx, balanceID)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).([]model.BalanceLot), args.Error(1)
+}
+
+func (m *MockDataSource) CreateHoliday(ctx context.Context, holiday model.MarketHoliday) (model.MarketHoliday, error) {
+	args := m.Called(ctx, holiday)
+	return args.Get(0).(model.MarketHoliday), args.Error(1)
+}
+
+func (m *MockDataSource) GetHolidays(ctx context.Context, venue string, from, to time.Time) ([]model.MarketHoliday, error) {
+	args := m.Called(ctx, venue, from, to)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).([]model.MarketHoliday), args.Error(1)
+}

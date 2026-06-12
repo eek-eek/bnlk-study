@@ -66,6 +66,20 @@ func (a Api) Router() *gin.Engine {
 	router.PUT("/balances/:id/identity", a.UpdateBalanceIdentity)
 	router.GET("/balances/:id/lineage", a.GetBalanceLineage)
 
+	// Brokerage routes (TradeControl balance subsystem port)
+	router.POST("/brokerage/holidays", a.CreateMarketHoliday)
+	router.GET("/brokerage/holidays/:venue", a.GetMarketHolidays)
+	router.POST("/brokerage/settle-date", a.ComputeSettleDate)
+	router.POST("/brokerage/positions", a.CreatePosition)
+	router.GET("/brokerage/positions/active", a.GetActivePosition)
+	router.POST("/brokerage/trades", a.BookTrade)
+	router.POST("/brokerage/trades/:txID/settle", a.SettleTrade)
+	router.POST("/brokerage/settlements/run", a.RunSettlement)
+	router.POST("/brokerage/mutations", a.ApplyMutationPlan)
+	router.POST("/brokerage/balances/recalculate-holds", a.RecalculateHolds)
+	router.GET("/brokerage/balances/:id/free", a.GetFreeBalance)
+	router.GET("/brokerage/balances/:id/lots", a.GetBalanceLots)
+
 	// Balance Monitor routes
 	router.POST("/balance-monitors", a.CreateBalanceMonitor)
 	router.GET("/balance-monitors/:id", a.GetBalanceMonitor)

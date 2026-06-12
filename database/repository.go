@@ -202,8 +202,8 @@ type lineage interface {
 type brokerage interface {
 	GetPosition(ctx context.Context, key model.PositionKey) (*model.Balance, error)                                                                  // Retrieves a position balance by exact key
 	GetPositionByID(ctx context.Context, balanceID string) (*model.Balance, error)                                                                   // Retrieves a balance by ID with brokerage columns
-	FindOrCreatePosition(ctx context.Context, key model.PositionKey, settleDate *time.Time) (*model.Balance, error)                                  // Retrieves or creates a position balance
-	GetActivePosition(ctx context.Context, ledgerID, identityID, accountRef, instrument, currency string, maxSettleCode *int) (*model.Balance, error) // Resolves the active balance via the settle cascade (T+N -> ... -> spot)
+	FindOrCreatePosition(ctx context.Context, key model.PositionKey) (*model.Balance, error)                                                                  // Retrieves or creates a position balance (bucket keyed by settle_date)
+	GetActivePosition(ctx context.Context, ledgerID, identityID, accountRef, instrument, currency string, maxSettleDate *time.Time) (*model.Balance, error) // Resolves the active balance via the settle-date cascade (latest <= date -> spot)
 	GetMaturedPositions(ctx context.Context, asOf time.Time, limit int) ([]*model.Balance, error)                                                    // Lists future balances whose settle date has been reached
 	ApplyBalanceDeltas(ctx context.Context, deltas []model.BalanceDelta) error                                                                       // Applies a normalized mutation plan atomically
 	RecomputeHolds(ctx context.Context, balanceID string) (*big.Int, *big.Int, error)                                                                // Rebuilds blocked/waiting holds from live INFLIGHT transactions

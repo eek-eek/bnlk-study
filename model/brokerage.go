@@ -31,28 +31,42 @@ import (
 	"github.com/shopspring/decimal"
 )
 
-// SpotSettleCode is the sentinel used in lock keys and database lookups for
-// spot (settle_code IS NULL) balances.
-const SpotSettleCode = -1
+// SpotSettleDateSentinel is the date used in COALESCE expressions to represent
+// the spot (settle_date IS NULL) balance, so spot and future buckets share one
+// comparison domain.
+const SpotSettleDateSentinel = "1970-01-01"
 
 // PositionKey uniquely identifies a brokerage-managed balance
 // (TradeControl BalanceKey analog). Instrument == "" denotes a money balance.
-// SettleCode == nil denotes the spot balance, N denotes the T+N balance.
+//
+// The settlement dimension of the identity is the ABSOLUTE settle date, not the
+// T+N offset: SettleDate == nil denotes the spot balance, a concrete date
+// denotes the future bucket settling that day. This makes multi-day accounting
+// correct — trades with the same offset on different trade dates land in
+// distinct buckets — and supports cases where the offset N is not controlled
+// (only the settlement date is known). SettleCode is an optional informational
+// attribute (the offset, when known); it is not part of the identity.
 type PositionKey struct {
-	LedgerID   string `json:"ledger_id"`
-	IdentityID string `json:"identity_id"`
-	AccountRef string `json:"account_ref"`
-	Instrument string `json:"instrument,omitempty"`
-	Currency   string `json:"currency"`
-	SettleCode *int   `json:"settle_code,omitempty"`
+	LedgerID   string     `json:"ledger_id"`
+	IdentityID string     `json:"identity_id"`
+	AccountRef string     `json:"account_ref"`
+	Instrument string     `json:"instrument,omitempty"`
+	Currency   string     `json:"currency"`
+	SettleDate *time.Time `json:"settle_date,omitempty"`
+	SettleCode *int       `json:"settle_code,omitempty"`
 }
 
-// settleCodeOrSpot normalizes the nullable settle code for keys and queries.
-func (k PositionKey) settleCodeOrSpot() int {
-	if k.SettleCode == nil {
-		return SpotSettleCode
+// settleDateKey normalizes the nullable settle date for lock keys and queries.
+func (k PositionKey) settleDateKey() string {
+	if k.SettleDate == nil {
+		return SpotSettleDateSentinel
 	}
-	return *k.SettleCode
+	return k.SettleDate.Format(HolidayKeyFormat)
+}
+
+// IsSpot reports whether the key addresses the settled (spot) balance.
+func (k PositionKey) IsSpot() bool {
+	return k.SettleDate == nil
 }
 
 // LockKey returns the deterministic pipe-joined lock key for this position
@@ -60,7 +74,7 @@ func (k PositionKey) settleCodeOrSpot() int {
 func (k PositionKey) LockKey() string {
 	return strings.Join([]string{
 		"brokerage", k.LedgerID, k.IdentityID, k.AccountRef,
-		k.Instrument, k.Currency, fmt.Sprintf("%d", k.settleCodeOrSpot()),
+		k.Instrument, k.Currency, k.settleDateKey(),
 	}, "|")
 }
 
@@ -74,9 +88,6 @@ func (k PositionKey) Validate() error {
 	}
 	if k.Currency == "" {
 		return fmt.Errorf("position key: currency is required")
-	}
-	if k.SettleCode != nil && *k.SettleCode < 0 {
-		return fmt.Errorf("position key: settle_code must be >= 0")
 	}
 	return nil
 }
@@ -414,8 +425,12 @@ type TradeBooking struct {
 	// Precision for the money leg (e.g. 100 for cents).
 	MoneyPrecision float64 `json:"money_precision"`
 
-	SettleOffset int       `json:"settle_offset"` // T+N
+	SettleOffset int       `json:"settle_offset"` // T+N (used when SettleDate is zero)
 	TradeDate    time.Time `json:"trade_date"`
+	// SettleDate, when non-zero, sets the settlement date explicitly. Use this
+	// when the offset N is not controlled and only the date is known; it wins
+	// over SettleOffset and the venue holiday calendar.
+	SettleDate time.Time `json:"settle_date"`
 
 	// SettlementBalanceID receives the money hold (broker settlement balance).
 	SettlementBalanceID string `json:"settlement_balance_id"`
@@ -487,9 +502,12 @@ type SellBooking struct {
 	MoneyPrecision    float64 `json:"money_precision"`
 
 	// SettleOffset is the requested T+N; it is overridden by the instrument
-	// settings when those exist.
+	// settings when those exist, and ignored when SettleDate is set.
 	SettleOffset int       `json:"settle_offset"`
 	TradeDate    time.Time `json:"trade_date"`
+	// SettleDate, when non-zero, sets the settlement date explicitly (used when
+	// the offset N is not controlled). It wins over SettleOffset.
+	SettleDate time.Time `json:"settle_date"`
 
 	// SettlementBalanceID is the broker settlement balance funding the proceeds.
 	SettlementBalanceID string `json:"settlement_balance_id"`

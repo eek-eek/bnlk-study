@@ -720,16 +720,16 @@ func (m *MockDataSource) GetPositionByID(ctx context.Context, balanceID string) 
 	return args.Get(0).(*model.Balance), args.Error(1)
 }
 
-func (m *MockDataSource) FindOrCreatePosition(ctx context.Context, key model.PositionKey, settleDate *time.Time) (*model.Balance, error) {
-	args := m.Called(ctx, key, settleDate)
+func (m *MockDataSource) FindOrCreatePosition(ctx context.Context, key model.PositionKey) (*model.Balance, error) {
+	args := m.Called(ctx, key)
 	if args.Get(0) == nil {
 		return nil, args.Error(1)
 	}
 	return args.Get(0).(*model.Balance), args.Error(1)
 }
 
-func (m *MockDataSource) GetActivePosition(ctx context.Context, ledgerID, identityID, accountRef, instrument, currency string, maxSettleCode *int) (*model.Balance, error) {
-	args := m.Called(ctx, ledgerID, identityID, accountRef, instrument, currency, maxSettleCode)
+func (m *MockDataSource) GetActivePosition(ctx context.Context, ledgerID, identityID, accountRef, instrument, currency string, maxSettleDate *time.Time) (*model.Balance, error) {
+	args := m.Called(ctx, ledgerID, identityID, accountRef, instrument, currency, maxSettleDate)
 	if args.Get(0) == nil {
 		return nil, args.Error(1)
 	}

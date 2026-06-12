@@ -67,22 +67,37 @@ future-позиции на market (`AllowOverdraft`, т.к. покрыто пр�
 (блендинг 100@150 + 50@180 по 150 бумагам). Для immediate-инструмента та же
 продажа 125 была бы отклонена (доступно только 100).
 
-### Известное ограничение
-Future-балансы идентифицируются по `settle_code` (смещению T+N), а не по
-абсолютной `settle_date`. Сделки одного инструмента/счёта с одинаковым T+N в
-разные торговые дни попадают в один bucket. Для сценария «в пределах одного
-дня» (как выше) это корректно; для мультидневного разделения нужен переход на
-ключ по `settle_date` — следующий шаг.
+### Мультидневный учёт (ключ по абсолютной дате)
+Future-балансы идентифицируются по **абсолютной `settle_date`**, а не по
+смещению `settle_code`. Поэтому:
+
+- сделки одного инструмента/счёта с одинаковым T+N в **разные торговые дни**
+  образуют **разные** bucket'ы (например, покупка в Пн T+2 → Ср и в Вт T+2 →
+  Чт — две отдельные позиции, расчёты независимы по своим датам);
+- смещение **N может не контролироваться**: можно передать `settle_date`
+  напрямую (в `BookTrade`/`SellTrade` или DTO), тогда `settle_offset` и
+  праздничный календарь игнорируются, а `settle_code` хранится как `NULL`
+  (справочный атрибут);
+- уникальный индекс ключа позиции — по
+  `(ledger, identity, account_ref, instrument, currency, COALESCE(settle_date,'1970-01-01'))`;
+- каскад `GetActivePosition` идёт по `settle_date` (последний bucket с
+  `settle_date ≤ запрошенной даты`, иначе spot); `SumFutureHolds`,
+  `GetMaturedPositions` фильтруют по `settle_date`.
+
+Проверено сквозными тестами на реальном PostgreSQL: `TestBrokerageChain_MultiDaySeparateBuckets`
+(две T+2-покупки в разные дни оседают в свои даты + покупка с явной датой при
+неконтролируемом N) и `TestBrokerageChain_BuyT2ThenSellExceedingSettled`.
 
 ## 2. Семантика settle T+N
 
-- `settle_code = NULL` — текущий (spot) баланс; `settle_code = N` — будущий
-  баланс с расчётом `settle_date`.
+- `settle_date = NULL` — текущий (spot) баланс; `settle_date = D` — будущий
+  баланс, рассчитываемый в день D. `settle_code` (смещение N) — необязательный
+  справочный атрибут.
 - **Каскадное чтение** активного баланса (как `getActiveBalanceByAccount`):
-  запросили T+2 → если нет, откат T+1 → T+0 → spot (`settle_code IS NULL`).
-  Реализовано одним SQL-запросом с `ORDER BY settle_code DESC NULLS LAST LIMIT 1`.
+  запросили дату D → последний bucket с `settle_date ≤ D`, иначе откат к spot
+  (`settle_date IS NULL`). Один SQL с `ORDER BY settle_date DESC NULLS LAST LIMIT 1`.
 - **Уникальность ключа**: частичный уникальный индекс по
-  `(ledger_id, identity_id, account_ref, instrument, currency, settle_code)`
+  `(ledger_id, identity_id, account_ref, instrument, currency, COALESCE(settle_date,'1970-01-01'))`
   для брокерских балансов (`account_ref IS NOT NULL`) — дубль активной записи
   невозможен на уровне БД (в TradeControl это runtime-ошибка «Слишком много
   записей…»; здесь — гарантия схемы).

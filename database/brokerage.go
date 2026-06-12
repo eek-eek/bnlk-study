@@ -46,10 +46,13 @@ const positionSelectColumns = `
     b.settle_date, b.settle_code, b.wa_price::text`
 
 // positionKeyPredicate matches a balance row against a model.PositionKey using
-// the same COALESCE normalization as the idx_balances_position_key index.
+// the same COALESCE normalization as the idx_balances_position_key index. The
+// settlement dimension is the absolute settle_date (nil/spot -> sentinel),
+// making buckets multi-day correct independent of the T+N offset.
 const positionKeyPredicate = `
     b.ledger_id = $1 AND COALESCE(b.identity_id, '') = $2 AND b.account_ref = $3
-    AND COALESCE(b.instrument, '') = $4 AND b.currency = $5 AND COALESCE(b.settle_code, -1) = $6`
+    AND COALESCE(b.instrument, '') = $4 AND b.currency = $5
+    AND COALESCE(b.settle_date, DATE '1970-01-01') = COALESCE($6::date, DATE '1970-01-01')`
 
 // rowScanner abstracts *sql.Row and *sql.Rows for the shared scan helper.
 type rowScanner interface {
@@ -105,13 +108,14 @@ func scanPositionRow(row rowScanner) (*model.Balance, error) {
 }
 
 // positionKeyArgs flattens a PositionKey into query arguments matching
-// positionKeyPredicate.
+// positionKeyPredicate. A nil settle date is passed as NULL so the COALESCE
+// resolves it to the spot sentinel.
 func positionKeyArgs(key model.PositionKey) []interface{} {
-	settleCode := model.SpotSettleCode
-	if key.SettleCode != nil {
-		settleCode = *key.SettleCode
+	var settleDate interface{}
+	if key.SettleDate != nil {
+		settleDate = *key.SettleDate
 	}
-	return []interface{}{key.LedgerID, key.IdentityID, key.AccountRef, key.Instrument, key.Currency, settleCode}
+	return []interface{}{key.LedgerID, key.IdentityID, key.AccountRef, key.Instrument, key.Currency, settleDate}
 }
 
 // GetPosition retrieves the position balance exactly matching the key.
@@ -133,14 +137,12 @@ func (d Datasource) GetPosition(ctx context.Context, key model.PositionKey) (*mo
 
 // FindOrCreatePosition returns the position balance for the key, creating it
 // if it does not exist (TradeControl createClearBalanceForRecalculate /
-// findOrCreateAndLock analog). settleDate must be provided when the key has a
-// settle code, so future balances always carry their settlement date.
-func (d Datasource) FindOrCreatePosition(ctx context.Context, key model.PositionKey, settleDate *time.Time) (*model.Balance, error) {
+// findOrCreateAndLock analog). The bucket is identified by the absolute
+// settle date carried on the key (nil = spot); the optional settle_code offset
+// is stored for reference only.
+func (d Datasource) FindOrCreatePosition(ctx context.Context, key model.PositionKey) (*model.Balance, error) {
 	if err := key.Validate(); err != nil {
 		return nil, apierror.NewAPIError(apierror.ErrBadRequest, err.Error(), err)
-	}
-	if key.SettleCode != nil && settleDate == nil {
-		return nil, apierror.NewAPIError(apierror.ErrBadRequest, "settle_date is required for a future (T+N) position", nil)
 	}
 
 	existing, err := d.GetPosition(ctx, key)
@@ -160,10 +162,12 @@ func (d Datasource) FindOrCreatePosition(ctx context.Context, key model.Position
 		instrument = nil
 	}
 	var settleCode interface{}
-	var settleDateArg interface{}
 	if key.SettleCode != nil {
 		settleCode = *key.SettleCode
-		settleDateArg = *settleDate
+	}
+	var settleDateArg interface{}
+	if key.SettleDate != nil {
+		settleDateArg = *key.SettleDate
 	}
 
 	balanceID := model.GenerateUUIDWithSuffix("bln")
@@ -208,13 +212,20 @@ func (d Datasource) GetPositionByID(ctx context.Context, balanceID string) (*mod
 }
 
 // GetActivePosition resolves the active balance for the dimensions using the
-// TradeControl settle cascade: the highest settle code <= maxSettleCode wins,
-// falling back through T+1, T+0 down to the spot balance (settle_code IS NULL).
-// maxSettleCode == nil restricts the lookup to the spot balance.
-func (d Datasource) GetActivePosition(ctx context.Context, ledgerID, identityID, accountRef, instrument, currency string, maxSettleCode *int) (*model.Balance, error) {
-	maxCode := model.SpotSettleCode
-	if maxSettleCode != nil {
-		maxCode = *maxSettleCode
+// TradeControl settle cascade by absolute date: the most-forward bucket whose
+// settle_date is on or before maxSettleDate wins, falling back to the spot
+// balance (settle_date IS NULL). maxSettleDate == nil restricts the lookup to
+// the spot balance.
+func (d Datasource) GetActivePosition(ctx context.Context, ledgerID, identityID, accountRef, instrument, currency string, maxSettleDate *time.Time) (*model.Balance, error) {
+	if maxSettleDate == nil {
+		row := d.Conn.QueryRowContext(ctx, `
+            SELECT `+positionSelectColumns+`
+            FROM blnk.balances b
+            WHERE b.ledger_id = $1 AND COALESCE(b.identity_id, '') = $2 AND b.account_ref = $3
+              AND COALESCE(b.instrument, '') = $4 AND b.currency = $5 AND b.settle_date IS NULL
+            LIMIT 1`,
+			ledgerID, identityID, accountRef, instrument, currency)
+		return scanActivePosition(row)
 	}
 
 	row := d.Conn.QueryRowContext(ctx, `
@@ -222,11 +233,15 @@ func (d Datasource) GetActivePosition(ctx context.Context, ledgerID, identityID,
         FROM blnk.balances b
         WHERE b.ledger_id = $1 AND COALESCE(b.identity_id, '') = $2 AND b.account_ref = $3
           AND COALESCE(b.instrument, '') = $4 AND b.currency = $5
-          AND COALESCE(b.settle_code, -1) <= $6
-        ORDER BY COALESCE(b.settle_code, -1) DESC
+          AND (b.settle_date IS NULL OR b.settle_date <= $6)
+        ORDER BY b.settle_date DESC NULLS LAST
         LIMIT 1`,
-		ledgerID, identityID, accountRef, instrument, currency, maxCode)
+		ledgerID, identityID, accountRef, instrument, currency, *maxSettleDate)
+	return scanActivePosition(row)
+}
 
+// scanActivePosition scans a cascade row, mapping no-rows to NotFound.
+func scanActivePosition(row rowScanner) (*model.Balance, error) {
 	balance, err := scanPositionRow(row)
 	if err == sql.ErrNoRows {
 		return nil, apierror.NewAPIError(apierror.ErrNotFound, "No active position found for the requested dimensions", err)
@@ -243,7 +258,7 @@ func (d Datasource) GetMaturedPositions(ctx context.Context, asOf time.Time, lim
 	rows, err := d.Conn.QueryContext(ctx, `
         SELECT `+positionSelectColumns+`
         FROM blnk.balances b
-        WHERE b.account_ref IS NOT NULL AND b.settle_code IS NOT NULL AND b.settle_date <= $1
+        WHERE b.account_ref IS NOT NULL AND b.settle_date IS NOT NULL AND b.settle_date <= $1
         ORDER BY b.settle_date ASC
         LIMIT $2`, asOf, limit)
 	if err != nil {
@@ -343,16 +358,20 @@ func (d Datasource) applyOneDelta(ctx context.Context, tx *sql.Tx, delta model.B
 		if delta.Key.SettleCode != nil {
 			settleCode = *delta.Key.SettleCode
 		}
+		var settleDate interface{}
+		if delta.Key.SettleDate != nil {
+			settleDate = *delta.Key.SettleDate
+		}
 		_, err = tx.ExecContext(ctx, `
             INSERT INTO blnk.balances
                 (balance_id, balance, credit_balance, debit_balance,
                  inflight_balance, inflight_credit_balance, inflight_debit_balance,
                  currency, ledger_id, identity_id, created_at, meta_data,
-                 account_ref, instrument, settle_code)
-            VALUES ($1, 0, 0, 0, 0, 0, 0, $2, $3, $4, $5, '{}', $6, $7, $8)
+                 account_ref, instrument, settle_date, settle_code)
+            VALUES ($1, 0, 0, 0, 0, 0, 0, $2, $3, $4, $5, '{}', $6, $7, $8, $9)
             ON CONFLICT DO NOTHING`,
 			model.GenerateUUIDWithSuffix("bln"), delta.Key.Currency, delta.Key.LedgerID,
-			identityID, time.Now(), delta.Key.AccountRef, instrument, settleCode)
+			identityID, time.Now(), delta.Key.AccountRef, instrument, settleDate, settleCode)
 		if err != nil {
 			return apierror.NewAPIError(apierror.ErrInternalServer, "Failed to create position for mutation", err)
 		}

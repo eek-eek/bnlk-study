@@ -18,7 +18,6 @@ package api
 import (
 	"math/big"
 	"net/http"
-	"strconv"
 	"time"
 
 	model2 "github.com/blnkfinance/blnk/api/model"
@@ -115,12 +114,12 @@ func (a Api) CreatePosition(c *gin.Context) {
 		respondCode(c, apierror.ErrGenValidation, err.Error(), nil)
 		return
 	}
-	settleDate, err := request.ParsedSettleDate()
+	key, err := request.ToPositionKey()
 	if err != nil {
 		respondCode(c, apierror.ErrGenValidation, err.Error(), nil)
 		return
 	}
-	resp, err := a.blnk.GetOrCreatePosition(c.Request.Context(), request.ToPositionKey(), settleDate)
+	resp, err := a.blnk.GetOrCreatePosition(c.Request.Context(), key)
 	if err != nil {
 		respondError(c, err)
 		return
@@ -128,8 +127,9 @@ func (a Api) CreatePosition(c *gin.Context) {
 	c.JSON(http.StatusCreated, resp)
 }
 
-// GetActivePosition resolves the active balance through the settle cascade
-// (max_settle_code falls back T+N -> ... -> T+0 -> spot).
+// GetActivePosition resolves the active balance through the settle-date cascade
+// (the latest bucket settling on or before max_settle_date, falling back to
+// spot). Omit max_settle_date to read the spot balance.
 func (a Api) GetActivePosition(c *gin.Context) {
 	ledgerID := c.Query("ledger_id")
 	accountRef := c.Query("account_ref")
@@ -139,18 +139,18 @@ func (a Api) GetActivePosition(c *gin.Context) {
 		return
 	}
 
-	var maxSettleCode *int
-	if raw := c.Query("max_settle_code"); raw != "" {
-		parsed, err := strconv.Atoi(raw)
-		if err != nil || parsed < 0 {
-			respondCode(c, apierror.ErrGenValidation, "max_settle_code must be a non-negative integer", nil)
+	var maxSettleDate *time.Time
+	if raw := c.Query("max_settle_date"); raw != "" {
+		parsed, err := time.Parse(model.HolidayKeyFormat, raw)
+		if err != nil {
+			respondCode(c, apierror.ErrGenValidation, "max_settle_date must be a date YYYY-MM-DD", nil)
 			return
 		}
-		maxSettleCode = &parsed
+		maxSettleDate = &parsed
 	}
 
 	resp, err := a.blnk.GetActivePosition(c.Request.Context(), ledgerID, c.Query("identity_id"),
-		accountRef, c.Query("instrument"), currency, maxSettleCode)
+		accountRef, c.Query("instrument"), currency, maxSettleDate)
 	if err != nil {
 		respondError(c, err)
 		return

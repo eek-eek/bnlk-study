@@ -38,7 +38,7 @@ func positionRows() *sqlmock.Rows {
 	})
 }
 
-func TestGetActivePosition_CascadePicksHighestSettleCode(t *testing.T) {
+func TestGetActivePosition_CascadePicksLatestByDate(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	assert.NoError(t, err)
 	defer func() { _ = db.Close() }()
@@ -51,25 +51,24 @@ func TestGetActivePosition_CascadePicksHighestSettleCode(t *testing.T) {
 		"acc1", "KZAP", settleDate, 2, "19000.00",
 	)
 
-	// The cascade query orders by settle code descending and limits to one row.
-	mock.ExpectQuery(`ORDER BY COALESCE\(b.settle_code, -1\) DESC`).
-		WithArgs("ldg1", "idn1", "acc1", "KZAP", "KZT", 2).
+	// The cascade orders by absolute settle date descending and limits to one row.
+	maxDate := time.Date(2026, 6, 16, 0, 0, 0, 0, time.UTC)
+	mock.ExpectQuery(`ORDER BY b.settle_date DESC NULLS LAST`).
+		WithArgs("ldg1", "idn1", "acc1", "KZAP", "KZT", maxDate).
 		WillReturnRows(rows)
 
-	two := 2
-	balance, err := ds.GetActivePosition(context.Background(), "ldg1", "idn1", "acc1", "KZAP", "KZT", &two)
+	balance, err := ds.GetActivePosition(context.Background(), "ldg1", "idn1", "acc1", "KZAP", "KZT", &maxDate)
 	assert.NoError(t, err)
 	assert.Equal(t, "bln_future", balance.BalanceID)
 	assert.Equal(t, "acc1", balance.AccountRef)
 	assert.Equal(t, "KZAP", balance.Instrument)
-	assert.NotNil(t, balance.SettleCode)
-	assert.Equal(t, 2, *balance.SettleCode)
+	assert.NotNil(t, balance.SettleDate)
 	assert.Equal(t, "19000.00", balance.WAPrice)
 	assert.Equal(t, big.NewInt(100), balance.Balance)
 	assert.NoError(t, mock.ExpectationsWereMet())
 }
 
-func TestGetActivePosition_SpotLookupUsesSentinel(t *testing.T) {
+func TestGetActivePosition_SpotLookupUsesNullDate(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	assert.NoError(t, err)
 	defer func() { _ = db.Close() }()
@@ -80,8 +79,9 @@ func TestGetActivePosition_SpotLookupUsesSentinel(t *testing.T) {
 		"KZT", "ldg1", "idn1", time.Now(), 1,
 		"acc1", "", nil, nil, nil,
 	)
-	mock.ExpectQuery(`ORDER BY COALESCE\(b.settle_code, -1\) DESC`).
-		WithArgs("ldg1", "idn1", "acc1", "", "KZT", model.SpotSettleCode).
+	// nil maxSettleDate restricts the lookup to the spot row (settle_date IS NULL).
+	mock.ExpectQuery(`b.settle_date IS NULL`).
+		WithArgs("ldg1", "idn1", "acc1", "", "KZT").
 		WillReturnRows(rows)
 
 	balance, err := ds.GetActivePosition(context.Background(), "ldg1", "idn1", "acc1", "", "KZT", nil)
@@ -99,10 +99,11 @@ func TestGetActivePosition_NotFound(t *testing.T) {
 	defer func() { _ = db.Close() }()
 	ds := Datasource{Conn: db}
 
-	mock.ExpectQuery(`ORDER BY COALESCE\(b.settle_code, -1\) DESC`).
+	maxDate := time.Date(2026, 6, 16, 0, 0, 0, 0, time.UTC)
+	mock.ExpectQuery(`ORDER BY b.settle_date DESC NULLS LAST`).
 		WillReturnRows(positionRows())
 
-	_, err = ds.GetActivePosition(context.Background(), "ldg1", "idn1", "acc1", "KZAP", "KZT", nil)
+	_, err = ds.GetActivePosition(context.Background(), "ldg1", "idn1", "acc1", "KZAP", "KZT", &maxDate)
 	assert.Error(t, err)
 	apiErr, ok := err.(apierror.APIError)
 	assert.True(t, ok)
@@ -126,7 +127,7 @@ func TestApplyBalanceDeltas_AppliesAmountAndHolds(t *testing.T) {
 
 	mock.ExpectBegin()
 	mock.ExpectQuery(`FOR UPDATE`).
-		WithArgs("ldg1", "idn1", "acc1", "", "KZT", model.SpotSettleCode).
+		WithArgs("ldg1", "idn1", "acc1", "", "KZT", nil).
 		WillReturnRows(sqlmock.NewRows([]string{
 			"balance_id", "credit_balance", "debit_balance", "inflight_credit_balance", "inflight_debit_balance",
 		}).AddRow("bln_1", "1000", "0", "0", "0"))
@@ -365,19 +366,28 @@ func TestGetLots_ReturnsOldestFirst(t *testing.T) {
 	assert.NoError(t, mock.ExpectationsWereMet())
 }
 
-func TestFindOrCreatePosition_RequiresSettleDateForFuture(t *testing.T) {
-	db, _, err := sqlmock.New()
+func TestFindOrCreatePosition_FutureBucketKeyedByDate(t *testing.T) {
+	db, mock, err := sqlmock.New()
 	assert.NoError(t, err)
 	defer func() { _ = db.Close() }()
 	ds := Datasource{Conn: db}
 
-	two := 2
-	key := model.PositionKey{LedgerID: "ldg1", AccountRef: "acc1", Currency: "KZT", SettleCode: &two}
-	_, err = ds.FindOrCreatePosition(context.Background(), key, nil)
-	assert.Error(t, err)
-	apiErr, ok := err.(apierror.APIError)
-	assert.True(t, ok)
-	assert.Equal(t, apierror.ErrBadRequest, apiErr.Code)
+	settleDate := time.Date(2026, 6, 18, 0, 0, 0, 0, time.UTC)
+	// Future bucket is matched by its absolute settle date (6th arg), not the offset.
+	rows := positionRows().AddRow(
+		"bln_future", "0", "0", "0", "0", "0", "0",
+		"KZT", "ldg1", "", time.Now(), 1, "acc1", "KZAP", settleDate, nil, nil,
+	)
+	mock.ExpectQuery(`FROM blnk.balances`).
+		WithArgs("ldg1", "", "acc1", "KZAP", "KZT", settleDate).
+		WillReturnRows(rows)
+
+	// SettleCode nil (uncontrolled offset) is allowed; only the date identifies the bucket.
+	key := model.PositionKey{LedgerID: "ldg1", AccountRef: "acc1", Instrument: "KZAP", Currency: "KZT", SettleDate: &settleDate}
+	balance, err := ds.FindOrCreatePosition(context.Background(), key)
+	assert.NoError(t, err)
+	assert.Equal(t, "bln_future", balance.BalanceID)
+	assert.NoError(t, mock.ExpectationsWereMet())
 }
 
 func TestFindOrCreatePosition_ReturnsExisting(t *testing.T) {
@@ -390,12 +400,13 @@ func TestFindOrCreatePosition_ReturnsExisting(t *testing.T) {
 		"bln_existing", "0", "0", "0", "0", "0", "0",
 		"KZT", "ldg1", "", time.Now(), 1, "acc1", "", nil, nil, nil,
 	)
+	// Spot key: the settle-date arg is NULL.
 	mock.ExpectQuery(`FROM blnk.balances`).
-		WithArgs("ldg1", "", "acc1", "", "KZT", model.SpotSettleCode).
+		WithArgs("ldg1", "", "acc1", "", "KZT", nil).
 		WillReturnRows(rows)
 
 	key := model.PositionKey{LedgerID: "ldg1", AccountRef: "acc1", Currency: "KZT"}
-	balance, err := ds.FindOrCreatePosition(context.Background(), key, nil)
+	balance, err := ds.FindOrCreatePosition(context.Background(), key)
 	assert.NoError(t, err)
 	assert.Equal(t, "bln_existing", balance.BalanceID)
 	assert.NoError(t, mock.ExpectationsWereMet())
@@ -416,7 +427,7 @@ func TestFindOrCreatePosition_CreatesWhenMissing(t *testing.T) {
 	))
 
 	key := model.PositionKey{LedgerID: "ldg1", AccountRef: "acc1", Currency: "KZT"}
-	balance, err := ds.FindOrCreatePosition(context.Background(), key, nil)
+	balance, err := ds.FindOrCreatePosition(context.Background(), key)
 	assert.NoError(t, err)
 	assert.Equal(t, "bln_created", balance.BalanceID)
 	assert.NoError(t, mock.ExpectationsWereMet())
@@ -429,7 +440,7 @@ func TestGetMaturedPositions(t *testing.T) {
 	ds := Datasource{Conn: db}
 
 	settleDate := time.Date(2026, 6, 16, 0, 0, 0, 0, time.UTC)
-	mock.ExpectQuery(`b.settle_code IS NOT NULL AND b.settle_date <= \$1`).
+	mock.ExpectQuery(`b.settle_date IS NOT NULL AND b.settle_date <= \$1`).
 		WithArgs(sqlmock.AnyArg(), 100).
 		WillReturnRows(positionRows().AddRow(
 			"bln_matured", "100", "100", "0", "0", "0", "0",

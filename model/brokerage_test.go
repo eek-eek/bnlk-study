@@ -158,13 +158,18 @@ func TestFreeBalance(t *testing.T) {
 }
 
 func TestPositionKeyLockKey(t *testing.T) {
-	two := 2
+	settleDate := date("2026-06-16")
+	otherDate := date("2026-06-17")
 	spot := PositionKey{LedgerID: "ldg", IdentityID: "idn", AccountRef: "acc", Instrument: "KZAP", Currency: "KZT"}
-	future := PositionKey{LedgerID: "ldg", IdentityID: "idn", AccountRef: "acc", Instrument: "KZAP", Currency: "KZT", SettleCode: &two}
+	future := PositionKey{LedgerID: "ldg", IdentityID: "idn", AccountRef: "acc", Instrument: "KZAP", Currency: "KZT", SettleDate: &settleDate}
+	otherFuture := PositionKey{LedgerID: "ldg", IdentityID: "idn", AccountRef: "acc", Instrument: "KZAP", Currency: "KZT", SettleDate: &otherDate}
 
-	assert.Equal(t, "brokerage|ldg|idn|acc|KZAP|KZT|-1", spot.LockKey())
-	assert.Equal(t, "brokerage|ldg|idn|acc|KZAP|KZT|2", future.LockKey())
+	// The settlement dimension of the lock key is the absolute date (spot -> sentinel).
+	assert.Equal(t, "brokerage|ldg|idn|acc|KZAP|KZT|1970-01-01", spot.LockKey())
+	assert.Equal(t, "brokerage|ldg|idn|acc|KZAP|KZT|2026-06-16", future.LockKey())
 	assert.NotEqual(t, spot.LockKey(), future.LockKey())
+	// Same instrument/account, different settle dates => distinct buckets (multi-day).
+	assert.NotEqual(t, future.LockKey(), otherFuture.LockKey())
 }
 
 func TestPositionKeyValidate(t *testing.T) {
@@ -174,10 +179,6 @@ func TestPositionKeyValidate(t *testing.T) {
 	assert.Error(t, PositionKey{AccountRef: "acc", Currency: "KZT"}.Validate())
 	assert.Error(t, PositionKey{LedgerID: "ldg", Currency: "KZT"}.Validate())
 	assert.Error(t, PositionKey{LedgerID: "ldg", AccountRef: "acc"}.Validate())
-
-	negative := -1
-	invalid := PositionKey{LedgerID: "ldg", AccountRef: "acc", Currency: "KZT", SettleCode: &negative}
-	assert.Error(t, invalid.Validate())
 }
 
 func TestMutationPlanNormalized(t *testing.T) {

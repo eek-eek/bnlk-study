@@ -25,19 +25,22 @@ import (
 	validation "github.com/go-ozzo/ozzo-validation/v4"
 )
 
-// PositionKeyRequest identifies a brokerage position in API requests.
+// PositionKeyRequest identifies a brokerage position in API requests. The
+// settlement bucket is identified by the absolute settle_date (omit for spot);
+// settle_code is an optional informational offset.
 type PositionKeyRequest struct {
 	LedgerID   string `json:"ledger_id"`
 	IdentityID string `json:"identity_id"`
 	AccountRef string `json:"account_ref"`
 	Instrument string `json:"instrument"`
 	Currency   string `json:"currency"`
+	SettleDate string `json:"settle_date"`
 	SettleCode *int   `json:"settle_code"`
 }
 
-// ToPositionKey converts the request into the domain key.
-func (p PositionKeyRequest) ToPositionKey() model.PositionKey {
-	return model.PositionKey{
+// ToPositionKey converts and validates the request into the domain key.
+func (p PositionKeyRequest) ToPositionKey() (model.PositionKey, error) {
+	key := model.PositionKey{
 		LedgerID:   p.LedgerID,
 		IdentityID: p.IdentityID,
 		AccountRef: p.AccountRef,
@@ -45,6 +48,14 @@ func (p PositionKeyRequest) ToPositionKey() model.PositionKey {
 		Currency:   p.Currency,
 		SettleCode: p.SettleCode,
 	}
+	if p.SettleDate != "" {
+		parsed, err := time.Parse(model.HolidayKeyFormat, p.SettleDate)
+		if err != nil {
+			return model.PositionKey{}, fmt.Errorf("invalid settle_date %q, expected YYYY-MM-DD", p.SettleDate)
+		}
+		key.SettleDate = &parsed
+	}
+	return key, nil
 }
 
 // ValidatePositionKey validates the mandatory key dimensions.
@@ -56,34 +67,14 @@ func (p PositionKeyRequest) ValidatePositionKey() error {
 	)
 }
 
-// CreatePositionRequest creates (or returns) a position balance. SettleDate is
-// required when SettleCode is set ("2006-01-02").
+// CreatePositionRequest creates (or returns) a position balance.
 type CreatePositionRequest struct {
 	PositionKeyRequest
-	SettleDate string `json:"settle_date"`
-}
-
-// ParsedSettleDate parses the optional settle date.
-func (c CreatePositionRequest) ParsedSettleDate() (*time.Time, error) {
-	if c.SettleDate == "" {
-		return nil, nil
-	}
-	parsed, err := time.Parse(model.HolidayKeyFormat, c.SettleDate)
-	if err != nil {
-		return nil, fmt.Errorf("invalid settle_date %q, expected YYYY-MM-DD", c.SettleDate)
-	}
-	return &parsed, nil
 }
 
 // ValidateCreatePosition validates the request.
 func (c CreatePositionRequest) ValidateCreatePosition() error {
-	if err := c.ValidatePositionKey(); err != nil {
-		return err
-	}
-	if c.SettleCode != nil && c.SettleDate == "" {
-		return fmt.Errorf("settle_date is required when settle_code is set")
-	}
-	return nil
+	return c.ValidatePositionKey()
 }
 
 // BalanceDeltaRequest is one mutation plan entry; amounts are signed integer
@@ -121,8 +112,12 @@ func (b BalanceDeltaRequest) ToBalanceDelta() (model.BalanceDelta, error) {
 	if err != nil {
 		return model.BalanceDelta{}, err
 	}
+	key, err := b.Key.ToPositionKey()
+	if err != nil {
+		return model.BalanceDelta{}, err
+	}
 	return model.BalanceDelta{
-		Key:          b.Key.ToPositionKey(),
+		Key:          key,
 		AmountDelta:  amount,
 		BlockedDelta: blocked,
 		WaitingDelta: waiting,
@@ -211,6 +206,7 @@ type BookTradeRequest struct {
 
 	SettleOffset int    `json:"settle_offset"`
 	TradeDate    string `json:"trade_date"`
+	SettleDate   string `json:"settle_date"` // explicit settlement date (when N is uncontrolled)
 
 	SettlementBalanceID string `json:"settlement_balance_id"`
 	MarketBalanceID     string `json:"market_balance_id"`
@@ -242,6 +238,13 @@ func (b BookTradeRequest) ToTradeBooking() (model.TradeBooking, error) {
 			return model.TradeBooking{}, fmt.Errorf("invalid trade_date %q, expected YYYY-MM-DD", b.TradeDate)
 		}
 		booking.TradeDate = parsed
+	}
+	if b.SettleDate != "" {
+		parsed, err := time.Parse(model.HolidayKeyFormat, b.SettleDate)
+		if err != nil {
+			return model.TradeBooking{}, fmt.Errorf("invalid settle_date %q, expected YYYY-MM-DD", b.SettleDate)
+		}
+		booking.SettleDate = parsed
 	}
 	return booking, booking.Validate()
 }
@@ -302,6 +305,7 @@ type SellTradeRequest struct {
 
 	SettleOffset int    `json:"settle_offset"`
 	TradeDate    string `json:"trade_date"`
+	SettleDate   string `json:"settle_date"` // explicit settlement date (when N is uncontrolled)
 
 	SettlementBalanceID string `json:"settlement_balance_id"`
 	MarketBalanceID     string `json:"market_balance_id"`
@@ -333,6 +337,13 @@ func (s SellTradeRequest) ToSellBooking() (model.SellBooking, error) {
 			return model.SellBooking{}, fmt.Errorf("invalid trade_date %q, expected YYYY-MM-DD", s.TradeDate)
 		}
 		booking.TradeDate = parsed
+	}
+	if s.SettleDate != "" {
+		parsed, err := time.Parse(model.HolidayKeyFormat, s.SettleDate)
+		if err != nil {
+			return model.SellBooking{}, fmt.Errorf("invalid settle_date %q, expected YYYY-MM-DD", s.SettleDate)
+		}
+		booking.SettleDate = parsed
 	}
 	return booking, booking.Validate()
 }

@@ -87,16 +87,17 @@ func (l *Blnk) ComputeSettleDate(ctx context.Context, venue string, tradeDate ti
 }
 
 // GetOrCreatePosition resolves the position balance for the key, creating it
-// when missing. settleDate is required for future (T+N) keys.
-func (l *Blnk) GetOrCreatePosition(ctx context.Context, key model.PositionKey, settleDate *time.Time) (*model.Balance, error) {
-	return l.datasource.FindOrCreatePosition(ctx, key, settleDate)
+// when missing. The settlement bucket is identified by key.SettleDate
+// (nil = spot).
+func (l *Blnk) GetOrCreatePosition(ctx context.Context, key model.PositionKey) (*model.Balance, error) {
+	return l.datasource.FindOrCreatePosition(ctx, key)
 }
 
 // GetActivePosition resolves the active balance for the dimensions with the
-// TradeControl settle cascade (requested T+N falls back through lower codes
-// down to the spot balance).
-func (l *Blnk) GetActivePosition(ctx context.Context, ledgerID, identityID, accountRef, instrument, currency string, maxSettleCode *int) (*model.Balance, error) {
-	return l.datasource.GetActivePosition(ctx, ledgerID, identityID, accountRef, instrument, currency, maxSettleCode)
+// TradeControl settle cascade by date (the latest bucket settling on or before
+// maxSettleDate, falling back to spot).
+func (l *Blnk) GetActivePosition(ctx context.Context, ledgerID, identityID, accountRef, instrument, currency string, maxSettleDate *time.Time) (*model.Balance, error) {
+	return l.datasource.GetActivePosition(ctx, ledgerID, identityID, accountRef, instrument, currency, maxSettleDate)
 }
 
 // GetBalanceLots lists the purchase lots of a balance (BalanceDetail analog).
@@ -147,6 +148,24 @@ func (l *Blnk) resolveTradeParams(ctx context.Context, instrument string, reques
 		offset = 0
 	}
 	return tradeParams{onTheWay: settings.TradesOnTheWay, settleOffset: offset, venue: venue}, nil
+}
+
+// resolveSettlement returns the settlement date and the offset (when known) for
+// a trade. An explicit settle date wins over the T+N computation, covering the
+// case where the offset N is not controlled and only the date is known; the
+// returned offset is then nil. The date is normalized to a UTC midnight so it
+// matches a DATE column cleanly.
+func (l *Blnk) resolveSettlement(ctx context.Context, params tradeParams, tradeDate, explicit time.Time) (time.Time, *int, error) {
+	if !explicit.IsZero() {
+		d := time.Date(explicit.Year(), explicit.Month(), explicit.Day(), 0, 0, 0, 0, time.UTC)
+		return d, nil, nil
+	}
+	settleDate, err := l.ComputeSettleDate(ctx, params.venue, tradeDate, params.settleOffset)
+	if err != nil {
+		return time.Time{}, nil, err
+	}
+	code := params.settleOffset
+	return settleDate, &code, nil
 }
 
 // GetTradablePosition computes how much of a security position can be sold by
@@ -218,7 +237,7 @@ func (l *Blnk) SellTrade(ctx context.Context, booking model.SellBooking) (*model
 	if err != nil {
 		return nil, err
 	}
-	settleDate, err := l.ComputeSettleDate(ctx, params.venue, tradeDate, params.settleOffset)
+	settleDate, settleCode, err := l.resolveSettlement(ctx, params, tradeDate, booking.SettleDate)
 	if err != nil {
 		return nil, err
 	}
@@ -243,24 +262,24 @@ func (l *Blnk) SellTrade(ctx context.Context, booking model.SellBooking) (*model
 		IdentityID: booking.IdentityID,
 		AccountRef: booking.AccountRef,
 		Currency:   booking.Currency,
-	}, nil)
+	})
 	if err != nil {
 		return nil, err
 	}
 
-	// The delivery is booked on the T+N future position (settle_code = offset),
-	// created on the fly with its settle date. The outflow hold may exceed the
-	// settled spot quantity; AllowOverdraft is safe because the tradable check
-	// above already validated the netted availability.
-	settleCode := params.settleOffset
+	// The delivery is booked on the future bucket settling on settleDate, created
+	// on the fly. The outflow hold may exceed the settled spot quantity;
+	// AllowOverdraft is safe because the tradable check above already validated
+	// the netted availability.
 	deliverPosition, err := l.GetOrCreatePosition(ctx, model.PositionKey{
 		LedgerID:   booking.LedgerID,
 		IdentityID: booking.IdentityID,
 		AccountRef: booking.AccountRef,
 		Instrument: booking.Instrument,
 		Currency:   booking.Currency,
-		SettleCode: &settleCode,
-	}, &settleDate)
+		SettleDate: &settleDate,
+		SettleCode: settleCode,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -466,7 +485,7 @@ func (l *Blnk) BookTrade(ctx context.Context, booking model.TradeBooking) (*mode
 	if err != nil {
 		return nil, err
 	}
-	settleDate, err := l.ComputeSettleDate(ctx, params.venue, tradeDate, params.settleOffset)
+	settleDate, settleCode, err := l.resolveSettlement(ctx, params, tradeDate, booking.SettleDate)
 	if err != nil {
 		return nil, err
 	}
@@ -476,20 +495,20 @@ func (l *Blnk) BookTrade(ctx context.Context, booking model.TradeBooking) (*mode
 		IdentityID: booking.IdentityID,
 		AccountRef: booking.AccountRef,
 		Currency:   booking.Currency,
-	}, nil)
+	})
 	if err != nil {
 		return nil, err
 	}
 
-	settleCode := params.settleOffset
 	futurePosition, err := l.GetOrCreatePosition(ctx, model.PositionKey{
 		LedgerID:   booking.LedgerID,
 		IdentityID: booking.IdentityID,
 		AccountRef: booking.AccountRef,
 		Instrument: booking.Instrument,
 		Currency:   booking.Currency,
-		SettleCode: &settleCode,
-	}, &settleDate)
+		SettleDate: &settleDate,
+		SettleCode: settleCode,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -633,7 +652,7 @@ func (l *Blnk) settleFutureBalance(ctx context.Context, futureBalanceID string) 
 		AccountRef: future.AccountRef,
 		Instrument: future.Instrument,
 		Currency:   future.Currency,
-	}, nil)
+	})
 	if err != nil {
 		return nil, err
 	}

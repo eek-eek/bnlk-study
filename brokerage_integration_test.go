@@ -103,10 +103,11 @@ func TestBrokerageChain_BuyT2ThenSellExceedingSettled(t *testing.T) {
 	// Fund the client money balance so the buy money legs (which debit it) clear.
 	moneyPos, err := service.GetOrCreatePosition(ctx, model.PositionKey{
 		LedgerID: ledgerID, IdentityID: identityID, AccountRef: accountRef, Currency: currency,
-	}, nil)
+	})
 	require.NoError(t, err)
 	_, err = service.RecordTransaction(ctx, &model.Transaction{
-		Source: market.BalanceID, Destination: moneyPos.BalanceID,
+		TransactionID: model.GenerateUUIDWithSuffix("txn"),
+		Source:        market.BalanceID, Destination: moneyPos.BalanceID,
 		Amount: 100000000, AmountString: "100000000", Precision: 100, Currency: currency,
 		Reference: "fund-money", AllowOverdraft: true, SkipQueue: true,
 	})
@@ -178,4 +179,92 @@ func TestBrokerageChain_BuyT2ThenSellExceedingSettled(t *testing.T) {
 	// WA price blended the original 100 @ 150 with 50 @ 180 over 150 shares:
 	// (100*150 + 50*180) / 150 = 24000 / 150 = 160.00; the sell at WA leaves it.
 	assert.Equal(t, "160.00", finalSpot.WAPrice, "weighted-average price after settlement")
+}
+
+// TestBrokerageChain_MultiDaySeparateBuckets proves multi-day accounting: two
+// T+2 buys placed on different trade dates form distinct future buckets keyed
+// by their absolute settle dates, settle independently on their own dates, and
+// an explicit settle date works when the offset N is not controlled.
+func TestBrokerageChain_MultiDaySeparateBuckets(t *testing.T) {
+	service := newIntegrationBlnk(t)
+	ctx := context.Background()
+	ledgerID := mustCreateLedger(t, service)
+	const (
+		accountRef = "acct-multi"
+		instrument = "TSLA"
+		venue      = "NASDAQ"
+		currency   = "USD"
+	)
+
+	_, err := service.SetInstrumentSettings(ctx, model.InstrumentSettings{
+		Instrument: instrument, Venue: venue, TradesOnTheWay: true, SettleOffset: 2,
+	})
+	require.NoError(t, err)
+
+	market, err := service.CreateBalance(ctx, model.Balance{LedgerID: ledgerID, Currency: currency})
+	require.NoError(t, err)
+	settlement, err := service.CreateBalance(ctx, model.Balance{LedgerID: ledgerID, Currency: currency})
+	require.NoError(t, err)
+	moneyPos, err := service.GetOrCreatePosition(ctx, model.PositionKey{LedgerID: ledgerID, AccountRef: accountRef, Currency: currency})
+	require.NoError(t, err)
+	_, err = service.RecordTransaction(ctx, &model.Transaction{
+		TransactionID: model.GenerateUUIDWithSuffix("txn"),
+		Source:        market.BalanceID, Destination: moneyPos.BalanceID,
+		Amount: 100000000, AmountString: "100000000", Precision: 100, Currency: currency,
+		Reference: "fund-multi", AllowOverdraft: true, SkipQueue: true,
+	})
+	require.NoError(t, err)
+
+	// Buy 10 traded Monday (T+2 -> Wednesday) and 20 traded Tuesday (T+2 -> Thursday).
+	monday := time.Date(2026, 6, 15, 0, 0, 0, 0, time.UTC)
+	tuesday := monday.AddDate(0, 0, 1)
+	buyMon, err := service.BookTrade(ctx, model.TradeBooking{
+		LedgerID: ledgerID, AccountRef: accountRef, Instrument: instrument, Venue: venue, Currency: currency,
+		Quantity: 10, QuantityPrecision: 1, Price: "100.00", MoneyPrecision: 100,
+		SettleOffset: 2, TradeDate: monday, SettlementBalanceID: settlement.BalanceID, MarketBalanceID: market.BalanceID,
+		Reference: "buy-mon",
+	})
+	require.NoError(t, err)
+	buyTue, err := service.BookTrade(ctx, model.TradeBooking{
+		LedgerID: ledgerID, AccountRef: accountRef, Instrument: instrument, Venue: venue, Currency: currency,
+		Quantity: 20, QuantityPrecision: 1, Price: "100.00", MoneyPrecision: 100,
+		SettleOffset: 2, TradeDate: tuesday, SettlementBalanceID: settlement.BalanceID, MarketBalanceID: market.BalanceID,
+		Reference: "buy-tue",
+	})
+	require.NoError(t, err)
+
+	// Distinct settle dates => distinct buckets (Wed vs Thu).
+	assert.NotEqual(t, buyMon.SettleDate, buyTue.SettleDate)
+	assert.NotEqual(t, buyMon.PositionBalanceID, buyTue.PositionBalanceID, "different trade dates must form different buckets")
+
+	// Settle only what matured by Wednesday: just the Monday buy (10), not the Tuesday buy.
+	_, err = service.RunSettlement(ctx, buyMon.SettleDate, 100)
+	require.NoError(t, err)
+	spot, err := service.GetActivePosition(ctx, ledgerID, "", accountRef, instrument, currency, nil)
+	require.NoError(t, err)
+	assert.Equal(t, int64(10), spot.Balance.Int64(), "only the Wednesday bucket should have settled")
+
+	// Settle through Thursday: the Tuesday buy (20) now settles too -> 30 total.
+	_, err = service.RunSettlement(ctx, buyTue.SettleDate, 100)
+	require.NoError(t, err)
+	spot, err = service.GetActivePosition(ctx, ledgerID, "", accountRef, instrument, currency, nil)
+	require.NoError(t, err)
+	assert.Equal(t, int64(30), spot.Balance.Int64(), "both buckets settled")
+
+	// Buy with an EXPLICIT settle date (offset N uncontrolled): bucket keyed by the date.
+	explicit := time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)
+	buyExplicit, err := service.BookTrade(ctx, model.TradeBooking{
+		LedgerID: ledgerID, AccountRef: accountRef, Instrument: instrument, Venue: venue, Currency: currency,
+		Quantity: 5, QuantityPrecision: 1, Price: "100.00", MoneyPrecision: 100,
+		SettleDate: explicit, SettlementBalanceID: settlement.BalanceID, MarketBalanceID: market.BalanceID,
+		Reference: "buy-explicit",
+	})
+	require.NoError(t, err)
+	assert.Equal(t, "2026-07-01", buyExplicit.SettleDate.Format(model.HolidayKeyFormat), "explicit settle date is honored")
+
+	_, err = service.RunSettlement(ctx, explicit, 100)
+	require.NoError(t, err)
+	spot, err = service.GetActivePosition(ctx, ledgerID, "", accountRef, instrument, currency, nil)
+	require.NoError(t, err)
+	assert.Equal(t, int64(35), spot.Balance.Int64(), "explicit-date buy settled into spot")
 }

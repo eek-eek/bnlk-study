@@ -159,7 +159,7 @@ errorMessage, currency)`.
 Порт подсистемы `balance/mutation/` TradeControl:
 
 - `BalanceKey = (ledger, identity, account_ref, instrument, currency,
-  settle_code)`; `LockKey()` — pipe-join.
+  settle_date)`; `LockKey()` — pipe-join (settle_date; spot ⇒ sentinel).
 - `BalanceDelta = (key, amountDelta, blockedDelta, waitingDelta)` c `Merge()`
   и `IsNoOp()`; `MutationPlan.Normalized()` сливает дельты по ключу и
   сортирует по lock key — защита от deadlock.
@@ -213,9 +213,11 @@ ALTER TABLE blnk.balances
   ADD COLUMN settle_code INT,      -- NULL ⇒ spot, N ⇒ T+N
   ADD COLUMN wa_price    NUMERIC;  -- средневзвешенная цена (scale 2)
 
+-- Идентичность позиции — по абсолютной settle_date (мультидневный учёт),
+-- settle_code остаётся справочным. См. миграцию sql/1781256443.sql.
 CREATE UNIQUE INDEX idx_balances_position_key ON blnk.balances
-  (ledger_id, identity_id, account_ref, instrument, currency,
-   COALESCE(settle_code, -1))
+  (ledger_id, COALESCE(identity_id,''), account_ref, COALESCE(instrument,''), currency,
+   COALESCE(settle_date, DATE '1970-01-01'))
   WHERE account_ref IS NOT NULL;
 
 CREATE TABLE blnk.balance_lots (...);     -- аналог BalanceDetail

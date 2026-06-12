@@ -34,6 +34,13 @@ import (
 // skipped when no database is configured, so it never fails in environments
 // without a database while still verifying the full chain when one is present.
 func newIntegrationBlnk(t *testing.T) *Blnk {
+	service, _ := newIntegrationBlnkDS(t)
+	return service
+}
+
+// newIntegrationBlnkDS also returns the datasource, for tests that seed/inspect
+// rows directly (e.g. settlement journal recovery).
+func newIntegrationBlnkDS(t *testing.T) (*Blnk, database.IDataSource) {
 	t.Helper()
 	dns := os.Getenv("BLNK_TEST_DATA_SOURCE_DNS")
 	if dns == "" {
@@ -59,7 +66,7 @@ func newIntegrationBlnk(t *testing.T) *Blnk {
 	require.NoError(t, err)
 	service, err := NewBlnk(ds)
 	require.NoError(t, err)
-	return service
+	return service, ds
 }
 
 // seedSpotPosition creates a settled spot position of `qty` units by booking
@@ -267,4 +274,178 @@ func TestBrokerageChain_MultiDaySeparateBuckets(t *testing.T) {
 	spot, err = service.GetActivePosition(ctx, ledgerID, "", accountRef, instrument, currency, nil)
 	require.NoError(t, err)
 	assert.Equal(t, int64(35), spot.Balance.Int64(), "explicit-date buy settled into spot")
+}
+
+// TestBrokerageChain_ExplicitSettleDateIncoming verifies the item-1 fix: a buy
+// booked with an explicit settle_date (settle_code NULL) is counted as
+// in-transit incoming for a sale, so it is not silently excluded.
+func TestBrokerageChain_ExplicitSettleDateIncoming(t *testing.T) {
+	service := newIntegrationBlnk(t)
+	ctx := context.Background()
+	ledgerID := mustCreateLedger(t, service)
+	const (
+		accountRef = "acct-explicit"
+		instrument = "NVDA"
+		venue      = "NASDAQ"
+		currency   = "USD"
+	)
+	_, err := service.SetInstrumentSettings(ctx, model.InstrumentSettings{
+		Instrument: instrument, Venue: venue, TradesOnTheWay: true, SettleOffset: 2,
+	})
+	require.NoError(t, err)
+
+	market, err := service.CreateBalance(ctx, model.Balance{LedgerID: ledgerID, Currency: currency})
+	require.NoError(t, err)
+	settlement, err := service.CreateBalance(ctx, model.Balance{LedgerID: ledgerID, Currency: currency})
+	require.NoError(t, err)
+	moneyPos, err := service.GetOrCreatePosition(ctx, model.PositionKey{LedgerID: ledgerID, AccountRef: accountRef, Currency: currency})
+	require.NoError(t, err)
+	_, err = service.RecordTransaction(ctx, &model.Transaction{
+		TransactionID: model.GenerateUUIDWithSuffix("txn"),
+		Source:        market.BalanceID, Destination: moneyPos.BalanceID,
+		Amount: 100000000, AmountString: "100000000", Precision: 100, Currency: currency,
+		Reference: "fund-explicit", AllowOverdraft: true, SkipQueue: true,
+	})
+	require.NoError(t, err)
+
+	// Buy 10 with an EXPLICIT settle date (offset N uncontrolled -> settle_code NULL).
+	explicit := time.Date(2026, 7, 10, 0, 0, 0, 0, time.UTC)
+	_, err = service.BookTrade(ctx, model.TradeBooking{
+		LedgerID: ledgerID, AccountRef: accountRef, Instrument: instrument, Venue: venue, Currency: currency,
+		Quantity: 10, QuantityPrecision: 1, Price: "500.00", MoneyPrecision: 100,
+		SettleDate: explicit, SettlementBalanceID: settlement.BalanceID, MarketBalanceID: market.BalanceID,
+		Reference: "buy-explicit-10",
+	})
+	require.NoError(t, err)
+
+	// Despite settle_code = NULL, the in-transit 10 must be counted as incoming.
+	tradable, err := service.GetTradablePosition(ctx, ledgerID, "", accountRef, instrument, currency, explicit)
+	require.NoError(t, err)
+	assert.True(t, tradable.OnTheWay)
+	assert.Equal(t, int64(10), tradable.Incoming.Int64(), "explicit-settle_date buy must count as incoming")
+	assert.Equal(t, int64(10), tradable.Tradable.Int64())
+}
+
+// TestBrokerageChain_IdempotentResettlement verifies the item-2 fix: a closed
+// (zeroed) future bucket is not reprocessed by a later settlement run, and the
+// settlement journal has no leftover pending rows.
+func TestBrokerageChain_IdempotentResettlement(t *testing.T) {
+	service, ds := newIntegrationBlnkDS(t)
+	ctx := context.Background()
+	ledgerID := mustCreateLedger(t, service)
+	const (
+		accountRef = "acct-idem"
+		instrument = "AMD"
+		venue      = "NASDAQ"
+		currency   = "USD"
+	)
+	_, err := service.SetInstrumentSettings(ctx, model.InstrumentSettings{
+		Instrument: instrument, Venue: venue, TradesOnTheWay: true, SettleOffset: 2,
+	})
+	require.NoError(t, err)
+	market, err := service.CreateBalance(ctx, model.Balance{LedgerID: ledgerID, Currency: currency})
+	require.NoError(t, err)
+	settlement, err := service.CreateBalance(ctx, model.Balance{LedgerID: ledgerID, Currency: currency})
+	require.NoError(t, err)
+	moneyPos, err := service.GetOrCreatePosition(ctx, model.PositionKey{LedgerID: ledgerID, AccountRef: accountRef, Currency: currency})
+	require.NoError(t, err)
+	_, err = service.RecordTransaction(ctx, &model.Transaction{
+		TransactionID: model.GenerateUUIDWithSuffix("txn"),
+		Source:        market.BalanceID, Destination: moneyPos.BalanceID,
+		Amount: 100000000, AmountString: "100000000", Precision: 100, Currency: currency,
+		Reference: "fund-idem", AllowOverdraft: true, SkipQueue: true,
+	})
+	require.NoError(t, err)
+
+	buy, err := service.BookTrade(ctx, model.TradeBooking{
+		LedgerID: ledgerID, AccountRef: accountRef, Instrument: instrument, Venue: venue, Currency: currency,
+		Quantity: 40, QuantityPrecision: 1, Price: "100.00", MoneyPrecision: 100,
+		SettleOffset: 2, SettlementBalanceID: settlement.BalanceID, MarketBalanceID: market.BalanceID,
+		Reference: "buy-idem",
+	})
+	require.NoError(t, err)
+
+	first, err := service.RunSettlement(ctx, buy.SettleDate, 100)
+	require.NoError(t, err)
+	assert.GreaterOrEqual(t, first.Examined, 1)
+
+	spot, err := service.GetActivePosition(ctx, ledgerID, "", accountRef, instrument, currency, nil)
+	require.NoError(t, err)
+	assert.Equal(t, int64(40), spot.Balance.Int64())
+
+	// Re-run: the now-zeroed bucket must be skipped (idempotent), nothing settled.
+	second, err := service.RunSettlement(ctx, buy.SettleDate, 100)
+	require.NoError(t, err)
+	assert.Equal(t, 0, second.Examined, "closed bucket must not be reprocessed")
+	assert.Empty(t, second.Settled)
+
+	// No settlement journal rows should remain pending after a clean run.
+	pending, err := ds.ListPendingSettlementJournals(ctx, 100)
+	require.NoError(t, err)
+	assert.Empty(t, pending, "no pending settlement journals after a completed run")
+}
+
+// TestBrokerageChain_SettlementRecovery verifies the item-3 fix: a settlement
+// whose side effects (wa_price + lot) did not finish (a 'pending' journal row)
+// is completed deterministically and idempotently by ReconcileSettlement.
+func TestBrokerageChain_SettlementRecovery(t *testing.T) {
+	service, ds := newIntegrationBlnkDS(t)
+	ctx := context.Background()
+	ledgerID := mustCreateLedger(t, service)
+	const (
+		accountRef = "acct-recover"
+		instrument = "INTC"
+		currency   = "USD"
+	)
+
+	// A spot position to receive the WA + lot.
+	spot, err := service.GetOrCreatePosition(ctx, model.PositionKey{
+		LedgerID: ledgerID, AccountRef: accountRef, Instrument: instrument, Currency: currency,
+	})
+	require.NoError(t, err)
+
+	// Simulate a crashed settlement: a 'pending' journal row exists, but its
+	// side effects were never applied. wa_before 150 @ 100, buy 50 @ 180.
+	_, created, err := ds.BeginSettlementJournal(ctx, model.SettlementJournalEntry{
+		SecurityTxnID: "txn_crashed_sec",
+		TradeRef:      "buy-crashed",
+		SpotBalanceID: spot.BalanceID,
+		Instrument:    instrument,
+		Side:          model.TradeSideBuy,
+		WABefore:      "150.00",
+		QtyBefore:     "100",
+		Price:         "180",
+		Quantity:      "50",
+		Precision:     1,
+		Currency:      currency,
+	})
+	require.NoError(t, err)
+	assert.True(t, created)
+
+	// Recovery completes the side effects: wa_after = 160.00, one lot.
+	n, err := service.ReconcileSettlement(ctx, 100)
+	require.NoError(t, err)
+	assert.Equal(t, 1, n)
+
+	applied, err := ds.GetSettlementJournal(ctx, "txn_crashed_sec")
+	require.NoError(t, err)
+	assert.Equal(t, model.SettlementApplied, applied.Status)
+
+	spot, err = service.GetOrCreatePosition(ctx, model.PositionKey{
+		LedgerID: ledgerID, AccountRef: accountRef, Instrument: instrument, Currency: currency,
+	})
+	require.NoError(t, err)
+	assert.Equal(t, "160.00", spot.WAPrice, "wa recomputed deterministically on recovery")
+
+	lots, err := service.GetBalanceLots(ctx, spot.BalanceID)
+	require.NoError(t, err)
+	assert.Len(t, lots, 1)
+
+	// Idempotent: a second recovery does nothing new (no pending, no duplicate lot).
+	n2, err := service.ReconcileSettlement(ctx, 100)
+	require.NoError(t, err)
+	assert.Equal(t, 0, n2)
+	lots, err = service.GetBalanceLots(ctx, spot.BalanceID)
+	require.NoError(t, err)
+	assert.Len(t, lots, 1, "recovery must not duplicate the lot")
 }

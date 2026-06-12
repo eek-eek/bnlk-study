@@ -580,6 +580,35 @@ type SettlementRunResult struct {
 	Examined int                     `json:"examined"`
 }
 
+// Settlement journal statuses.
+const (
+	SettlementPending = "pending"
+	SettlementApplied = "applied"
+)
+
+// SettlementJournalEntry records the side effects of settling one trade's
+// security leg so they are atomic and recoverable. wa_before/qty_before are
+// captured before the inflight legs are committed, which makes wa_after
+// deterministic on a recovery pass regardless of how far the original run got.
+type SettlementJournalEntry struct {
+	SecurityTxnID string    `json:"security_txn_id"`
+	TradeRef      string    `json:"trade_ref"`
+	SpotBalanceID string    `json:"spot_balance_id"`
+	Instrument    string    `json:"instrument"`
+	Side          string    `json:"side"`
+	WABefore      string    `json:"wa_before"`
+	QtyBefore     string    `json:"qty_before"` // precise spot quantity before the trade
+	Price         string    `json:"price"`
+	Quantity      string    `json:"quantity"` // precise trade quantity
+	Precision     int64     `json:"precision"`
+	Currency      string    `json:"currency"`
+	WAAfter       string    `json:"wa_after,omitempty"`
+	LotID         string    `json:"lot_id,omitempty"`
+	Status        string    `json:"status"`
+	CreatedAt     time.Time `json:"created_at"`
+	UpdatedAt     time.Time `json:"updated_at"`
+}
+
 // HoldsRecalcResult summarizes a RecalculateHolds pass
 // (TradeControl recalculateBlockedWaiting* analog: per-id error aggregation).
 type HoldsRecalcResult struct {

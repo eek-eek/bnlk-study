@@ -675,19 +675,19 @@ func (l *Blnk) settleFutureBalance(ctx context.Context, futureBalanceID string) 
 	}
 
 	var results []model.TradeSettlementResult
-	// addedQty tracks buy quantity committed in this run so the WA blend of a
+	// addedPrecise tracks buy quantity committed in this run so the WA blend of a
 	// second buy accounts for earlier buys not yet rolled into spot.
-	addedQty := decimal.Zero
+	addedPrecise := big.NewInt(0)
 	for _, leg := range buys {
-		res, qty, err := l.settleSecurityLeg(ctx, leg, spot, future, addedQty)
+		res, qty, err := l.settleSecurityLeg(ctx, leg, spot, future, addedPrecise)
 		if err != nil {
 			return nil, err
 		}
-		addedQty = addedQty.Add(qty)
+		addedPrecise = new(big.Int).Add(addedPrecise, qty)
 		results = append(results, *res)
 	}
 	for _, leg := range sells {
-		res, _, err := l.settleSecurityLeg(ctx, leg, spot, future, addedQty)
+		res, _, err := l.settleSecurityLeg(ctx, leg, spot, future, addedPrecise)
 		if err != nil {
 			return nil, err
 		}
@@ -702,10 +702,13 @@ func (l *Blnk) settleFutureBalance(ctx context.Context, futureBalanceID string) 
 }
 
 // settleSecurityLeg commits one trade's money and security holds. For a buy it
-// refreshes the weighted-average price and records a lot, returning the bought
-// quantity as a decimal; for a sell it only commits (selling at WA leaves the
-// remaining WA unchanged).
-func (l *Blnk) settleSecurityLeg(ctx context.Context, securityTxn *model.Transaction, spot, future *model.Balance, addedQty decimal.Decimal) (*model.TradeSettlementResult, decimal.Decimal, error) {
+// refreshes the weighted-average price and records a lot **through the
+// settlement journal**, so the side effects are atomic and recoverable: a
+// pending journal row capturing wa_before/qty_before is written before the
+// commits, and the lot + wa_price + 'applied' flip happen in one DB transaction
+// afterwards. A crash in between leaves a pending row that ReconcileSettlement
+// finishes. Returns the bought quantity in precise units (zero for sells).
+func (l *Blnk) settleSecurityLeg(ctx context.Context, securityTxn *model.Transaction, spot, future *model.Balance, addedPrecise *big.Int) (*model.TradeSettlementResult, *big.Int, error) {
 	tradeRef := metaString(securityTxn.MetaData, model.TradeMetaRef)
 	isSell := metaString(securityTxn.MetaData, model.TradeMetaSide) == model.TradeSideSell
 	result := &model.TradeSettlementResult{
@@ -715,61 +718,139 @@ func (l *Blnk) settleSecurityLeg(ctx context.Context, securityTxn *model.Transac
 		SpotBalanceID:   spot.BalanceID,
 	}
 
+	zero := big.NewInt(0)
+	priceStr := metaString(securityTxn.MetaData, model.TradeMetaPrice)
+	hasSideEffects := !isSell && securityTxn.Precision >= 1 && priceStr != ""
+
+	// Phase 1: record a pending journal capturing the inputs needed to make
+	// wa_after deterministic on recovery (before any commit).
+	if hasSideEffects {
+		qtyBefore := new(big.Int).Add(spot.Balance, addedPrecise)
+		_, _, err := l.datasource.BeginSettlementJournal(ctx, model.SettlementJournalEntry{
+			SecurityTxnID: securityTxn.TransactionID,
+			TradeRef:      tradeRef,
+			SpotBalanceID: spot.BalanceID,
+			Instrument:    future.Instrument,
+			Side:          model.TradeSideBuy,
+			WABefore:      spot.WAPrice,
+			QtyBefore:     qtyBefore.String(),
+			Price:         priceStr,
+			Quantity:      securityTxn.PreciseAmount.String(),
+			Precision:     int64(securityTxn.Precision),
+			Currency:      securityTxn.Currency,
+		})
+		if err != nil {
+			return nil, zero, err
+		}
+	}
+
+	// Commit money + security holds.
 	if moneyLegID := metaString(securityTxn.MetaData, model.TradeMetaMoneyLegID); moneyLegID != "" {
 		if _, err := l.CommitInflightTransaction(ctx, moneyLegID, big.NewInt(0)); err != nil {
-			return nil, decimal.Zero, fmt.Errorf("failed to commit money leg %s: %w", moneyLegID, err)
+			return nil, zero, fmt.Errorf("failed to commit money leg %s: %w", moneyLegID, err)
 		}
 		result.MoneyTxnID = moneyLegID
 	}
 	if _, err := l.CommitInflightTransaction(ctx, securityTxn.TransactionID, big.NewInt(0)); err != nil {
-		return nil, decimal.Zero, fmt.Errorf("failed to commit security leg %s: %w", securityTxn.TransactionID, err)
+		return nil, zero, fmt.Errorf("failed to commit security leg %s: %w", securityTxn.TransactionID, err)
 	}
 
-	if isSell || securityTxn.Precision < 1 {
-		return result, decimal.Zero, nil
+	if !hasSideEffects {
+		return result, zero, nil
 	}
 
-	priceStr := metaString(securityTxn.MetaData, model.TradeMetaPrice)
-	if priceStr == "" {
-		return result, decimal.Zero, nil
-	}
+	// Phase 2: apply WA + lot + journal atomically.
 	price, err := decimal.NewFromString(priceStr)
 	if err != nil {
 		logrus.WithError(err).WithField("trade_ref", tradeRef).Warn("invalid trade price in metadata, skipping wa price update")
-		return result, decimal.Zero, nil
+		return result, zero, nil
 	}
-
-	qtyPrecision := decimal.NewFromFloat(securityTxn.Precision)
-	tradeQty := decimal.NewFromBigInt(securityTxn.PreciseAmount, 0).Div(qtyPrecision)
-	// currentQty = settled spot quantity plus buys already committed this run.
-	currentQty := decimal.NewFromBigInt(spot.Balance, 0).Div(qtyPrecision).Add(addedQty)
-	tradeMoney := tradeQty.Mul(price)
-
-	newWA, err := model.RecalculateWAPrice(spot.WAPrice, currentQty, tradeQty, tradeMoney)
+	qtyBefore := new(big.Int).Add(spot.Balance, addedPrecise)
+	waAfter, err := computeWAAfter(spot.WAPrice, qtyBefore, securityTxn.PreciseAmount, securityTxn.Precision, price)
 	if err != nil {
-		return nil, decimal.Zero, fmt.Errorf("failed to recalculate wa price: %w", err)
+		return nil, zero, fmt.Errorf("failed to recalculate wa price: %w", err)
 	}
-	if err := l.datasource.UpdateWAPrice(ctx, spot.BalanceID, newWA.StringFixed(2)); err != nil {
-		return nil, decimal.Zero, err
-	}
-	spot.WAPrice = newWA.StringFixed(2) // keep the in-memory snapshot consistent for the next buy
-	result.WAPrice = newWA.StringFixed(2)
-
-	lot, err := l.datasource.CreateLot(ctx, model.BalanceLot{
-		BalanceID:   spot.BalanceID,
-		Instrument:  future.Instrument,
-		Quantity:    new(big.Int).Set(securityTxn.PreciseAmount),
-		Precision:   int64(securityTxn.Precision),
-		Price:       price.String(),
-		Currency:    securityTxn.Currency,
-		Reference:   tradeRef,
-		PurchasedAt: time.Now(),
+	lotID, err := l.datasource.CompleteSettlementJournal(ctx, securityTxn.TransactionID, waAfter, model.BalanceLot{
+		BalanceID:  spot.BalanceID,
+		Instrument: future.Instrument,
+		Quantity:   new(big.Int).Set(securityTxn.PreciseAmount),
+		Precision:  int64(securityTxn.Precision),
+		Price:      price.String(),
+		Currency:   securityTxn.Currency,
+		Reference:  tradeRef,
 	})
 	if err != nil {
-		return nil, decimal.Zero, err
+		return nil, zero, err
 	}
-	result.LotID = lot.LotID
-	return result, tradeQty, nil
+	spot.WAPrice = waAfter // keep the in-memory snapshot consistent for the next buy
+	result.WAPrice = waAfter
+	result.LotID = lotID
+	return result, new(big.Int).Set(securityTxn.PreciseAmount), nil
+}
+
+// computeWAAfter deterministically blends the weighted-average price from the
+// journal inputs (all in precise units).
+func computeWAAfter(waBefore string, qtyBeforePrecise, tradeQtyPrecise *big.Int, precision float64, price decimal.Decimal) (string, error) {
+	qtyPrecision := decimal.NewFromFloat(precision)
+	currentQty := decimal.NewFromBigInt(qtyBeforePrecise, 0).Div(qtyPrecision)
+	tradeQty := decimal.NewFromBigInt(tradeQtyPrecise, 0).Div(qtyPrecision)
+	tradeMoney := tradeQty.Mul(price)
+	wa, err := model.RecalculateWAPrice(waBefore, currentQty, tradeQty, tradeMoney)
+	if err != nil {
+		return "", err
+	}
+	return wa.StringFixed(2), nil
+}
+
+// ReconcileSettlement completes settlement journal rows whose side effects
+// (wa_price + lot) did not finish — e.g. a crash between committing the inflight
+// legs and writing the side effects. The journal captured wa_before/qty_before,
+// so wa_after is recomputed deterministically and applied idempotently. Returns
+// the number of journals reconciled.
+func (l *Blnk) ReconcileSettlement(ctx context.Context, limit int) (int, error) {
+	if limit <= 0 {
+		limit = defaultSettlementBatch
+	}
+	pending, err := l.datasource.ListPendingSettlementJournals(ctx, limit)
+	if err != nil {
+		return 0, err
+	}
+	reconciled := 0
+	for _, e := range pending {
+		price, err := decimal.NewFromString(e.Price)
+		if err != nil {
+			logrus.WithError(err).WithField("security_txn_id", e.SecurityTxnID).Warn("invalid price in settlement journal, skipping")
+			continue
+		}
+		qtyBefore, ok := new(big.Int).SetString(e.QtyBefore, 10)
+		if !ok {
+			qtyBefore = big.NewInt(0)
+		}
+		tradeQty, ok := new(big.Int).SetString(e.Quantity, 10)
+		if !ok {
+			logrus.WithField("security_txn_id", e.SecurityTxnID).Warn("invalid quantity in settlement journal, skipping")
+			continue
+		}
+		waAfter, err := computeWAAfter(e.WABefore, qtyBefore, tradeQty, float64(e.Precision), price)
+		if err != nil {
+			logrus.WithError(err).WithField("security_txn_id", e.SecurityTxnID).Warn("wa recompute failed, skipping")
+			continue
+		}
+		if _, err := l.datasource.CompleteSettlementJournal(ctx, e.SecurityTxnID, waAfter, model.BalanceLot{
+			BalanceID:  e.SpotBalanceID,
+			Instrument: e.Instrument,
+			Quantity:   tradeQty,
+			Precision:  e.Precision,
+			Price:      price.String(),
+			Currency:   e.Currency,
+			Reference:  e.TradeRef,
+		}); err != nil {
+			logrus.WithError(err).WithField("security_txn_id", e.SecurityTxnID).Error("failed to reconcile settlement journal")
+			continue
+		}
+		reconciled++
+	}
+	return reconciled, nil
 }
 
 // netRollToSpot moves the settled quantity left on a future balance to its spot
@@ -818,6 +899,12 @@ func (l *Blnk) netRollToSpot(ctx context.Context, futureBalanceID, spotBalanceID
 func (l *Blnk) RunSettlement(ctx context.Context, asOf time.Time, limit int) (*model.SettlementRunResult, error) {
 	if limit <= 0 {
 		limit = defaultSettlementBatch
+	}
+	// Finish any side effects left pending by a previously interrupted run.
+	if n, err := l.ReconcileSettlement(ctx, limit); err != nil {
+		logrus.WithError(err).Warn("settlement reconcile pass failed")
+	} else if n > 0 {
+		logrus.WithField("reconciled", n).Info("recovered pending settlement journals")
 	}
 	matured, err := l.datasource.GetMaturedPositions(ctx, asOf, limit)
 	if err != nil {

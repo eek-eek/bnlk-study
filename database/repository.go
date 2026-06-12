@@ -217,6 +217,10 @@ type brokerage interface {
 	GetLots(ctx context.Context, balanceID string) ([]model.BalanceLot, error)                                                                       // Lists purchase lots of a balance
 	CreateHoliday(ctx context.Context, holiday model.MarketHoliday) (model.MarketHoliday, error)                                                     // Registers a venue holiday
 	GetHolidays(ctx context.Context, venue string, from, to time.Time) ([]model.MarketHoliday, error)                                                // Lists venue holidays in a range
+	BeginSettlementJournal(ctx context.Context, e model.SettlementJournalEntry) (*model.SettlementJournalEntry, bool, error)                         // Writes/returns a pending settlement journal row (idempotent)
+	GetSettlementJournal(ctx context.Context, securityTxnID string) (*model.SettlementJournalEntry, error)                                           // Reads a settlement journal row
+	CompleteSettlementJournal(ctx context.Context, securityTxnID, waAfter string, lot model.BalanceLot) (string, error)                              // Applies lot + wa_price + journal status atomically
+	ListPendingSettlementJournals(ctx context.Context, limit int) ([]model.SettlementJournalEntry, error)                                            // Lists settlement journals awaiting side effects
 }
 
 // chain defines the hash-chain (tamper-evidence) operations.

@@ -259,6 +259,9 @@ func (d Datasource) GetMaturedPositions(ctx context.Context, asOf time.Time, lim
         SELECT `+positionSelectColumns+`
         FROM blnk.balances b
         WHERE b.account_ref IS NOT NULL AND b.settle_date IS NOT NULL AND b.settle_date <= $1
+          -- Skip already-settled (zeroed) buckets so re-running settlement is
+          -- idempotent and closed buckets do not crowd the batch limit.
+          AND (b.balance <> 0 OR b.inflight_credit_balance <> 0 OR b.inflight_debit_balance <> 0)
         ORDER BY b.settle_date ASC
         LIMIT $2`, asOf, limit)
 	if err != nil {
@@ -498,7 +501,7 @@ func (d Datasource) RecomputeHolds(ctx context.Context, balanceID string) (*big.
 func (d Datasource) GetPendingInflightByDestination(ctx context.Context, balanceID string) ([]*model.Transaction, error) {
 	rows, err := d.Conn.QueryContext(ctx, `
         SELECT t.transaction_id, t.parent_transaction, t.source, t.reference, t.amount,
-               t.precise_amount, t.precision, t.currency, t.destination, t.description,
+               t.precise_amount::text, t.precision, t.currency, t.destination, t.description,
                t.status, t.created_at, t.meta_data
         FROM blnk.transactions t
         WHERE t.destination = $1
@@ -520,7 +523,7 @@ func (d Datasource) GetPendingInflightByDestination(ctx context.Context, balance
 	for rows.Next() {
 		transaction := model.Transaction{}
 		var metaDataJSON []byte
-		var preciseAmount int64
+		var preciseAmount string
 		err := rows.Scan(
 			&transaction.TransactionID, &transaction.ParentTransaction, &transaction.Source,
 			&transaction.Reference, &transaction.Amount, &preciseAmount, &transaction.Precision,
@@ -530,7 +533,11 @@ func (d Datasource) GetPendingInflightByDestination(ctx context.Context, balance
 		if err != nil {
 			return nil, apierror.NewAPIError(apierror.ErrInternalServer, "Failed to scan pending inflight transaction", err)
 		}
-		transaction.PreciseAmount = big.NewInt(preciseAmount)
+		precise, ok := new(big.Int).SetString(preciseAmount, 10)
+		if !ok {
+			return nil, apierror.NewAPIError(apierror.ErrInternalServer, fmt.Sprintf("Invalid precise_amount %q", preciseAmount), nil)
+		}
+		transaction.PreciseAmount = precise
 		if len(metaDataJSON) > 0 {
 			if err := json.Unmarshal(metaDataJSON, &transaction.MetaData); err != nil {
 				return nil, apierror.NewAPIError(apierror.ErrInternalServer, "Failed to unmarshal transaction metadata", err)
@@ -684,7 +691,7 @@ func (d Datasource) SumFutureHolds(ctx context.Context, ledgerID, identityID, ac
         FROM blnk.balances b
         WHERE b.ledger_id = $1 AND COALESCE(b.identity_id, '') = $2 AND b.account_ref = $3
           AND COALESCE(b.instrument, '') = $4 AND b.currency = $5
-          AND b.settle_code IS NOT NULL AND b.settle_date <= $6`,
+          AND b.settle_date IS NOT NULL AND b.settle_date <= $6`,
 		ledgerID, identityID, accountRef, instrument, currency, asOfSettleDate)
 
 	var incomingStr, outgoingStr string
@@ -709,7 +716,7 @@ func (d Datasource) SumFutureHolds(ctx context.Context, ledgerID, identityID, ac
 func (d Datasource) GetPendingInflightByBalance(ctx context.Context, balanceID string) ([]*model.Transaction, error) {
 	rows, err := d.Conn.QueryContext(ctx, `
         SELECT t.transaction_id, t.parent_transaction, t.source, t.reference, t.amount,
-               t.precise_amount, t.precision, t.currency, t.destination, t.description,
+               t.precise_amount::text, t.precision, t.currency, t.destination, t.description,
                t.status, t.created_at, t.meta_data
         FROM blnk.transactions t
         WHERE (t.source = $1 OR t.destination = $1)
@@ -731,7 +738,7 @@ func (d Datasource) GetPendingInflightByBalance(ctx context.Context, balanceID s
 	for rows.Next() {
 		transaction := model.Transaction{}
 		var metaDataJSON []byte
-		var preciseAmount int64
+		var preciseAmount string
 		err := rows.Scan(
 			&transaction.TransactionID, &transaction.ParentTransaction, &transaction.Source,
 			&transaction.Reference, &transaction.Amount, &preciseAmount, &transaction.Precision,
@@ -741,7 +748,11 @@ func (d Datasource) GetPendingInflightByBalance(ctx context.Context, balanceID s
 		if err != nil {
 			return nil, apierror.NewAPIError(apierror.ErrInternalServer, "Failed to scan pending inflight transaction", err)
 		}
-		transaction.PreciseAmount = big.NewInt(preciseAmount)
+		precise, ok := new(big.Int).SetString(preciseAmount, 10)
+		if !ok {
+			return nil, apierror.NewAPIError(apierror.ErrInternalServer, fmt.Sprintf("Invalid precise_amount %q", preciseAmount), nil)
+		}
+		transaction.PreciseAmount = precise
 		if len(metaDataJSON) > 0 {
 			if err := json.Unmarshal(metaDataJSON, &transaction.MetaData); err != nil {
 				return nil, apierror.NewAPIError(apierror.ErrInternalServer, "Failed to unmarshal transaction metadata", err)
@@ -801,4 +812,148 @@ func (d Datasource) GetHolidays(ctx context.Context, venue string, from, to time
 		return nil, apierror.NewAPIError(apierror.ErrInternalServer, "Failed to iterate holidays", err)
 	}
 	return holidays, nil
+}
+
+// --- Settlement journal (two-phase, idempotent side effects) ---
+
+// journalColumns is the shared SELECT list for settlement journal reads.
+const journalColumns = `
+    security_txn_id, COALESCE(trade_ref,''), spot_balance_id, COALESCE(instrument,''),
+    COALESCE(side,''), COALESCE(wa_before::text,''), COALESCE(qty_before::text,''),
+    COALESCE(price::text,''), COALESCE(quantity::text,''), COALESCE(precision,0),
+    COALESCE(currency,''), COALESCE(wa_after::text,''), COALESCE(lot_id,''),
+    status, created_at, updated_at`
+
+func scanJournal(row rowScanner) (*model.SettlementJournalEntry, error) {
+	e := &model.SettlementJournalEntry{}
+	err := row.Scan(
+		&e.SecurityTxnID, &e.TradeRef, &e.SpotBalanceID, &e.Instrument, &e.Side,
+		&e.WABefore, &e.QtyBefore, &e.Price, &e.Quantity, &e.Precision,
+		&e.Currency, &e.WAAfter, &e.LotID, &e.Status, &e.CreatedAt, &e.UpdatedAt,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return e, nil
+}
+
+// BeginSettlementJournal inserts a 'pending' journal row for a security leg, or
+// returns the existing row if one is already present (idempotency). The bool is
+// true when a new row was created.
+func (d Datasource) BeginSettlementJournal(ctx context.Context, e model.SettlementJournalEntry) (*model.SettlementJournalEntry, bool, error) {
+	now := time.Now()
+	res, err := d.Conn.ExecContext(ctx, `
+        INSERT INTO blnk.brokerage_settlement_journal
+            (security_txn_id, trade_ref, spot_balance_id, instrument, side,
+             wa_before, qty_before, price, quantity, precision, currency, status, created_at, updated_at)
+        VALUES ($1,$2,$3,$4,$5, NULLIF($6,'')::numeric, NULLIF($7,'')::numeric,
+                NULLIF($8,'')::numeric, NULLIF($9,'')::numeric, $10, $11, 'pending', $12, $12)
+        ON CONFLICT (security_txn_id) DO NOTHING`,
+		e.SecurityTxnID, e.TradeRef, e.SpotBalanceID, e.Instrument, e.Side,
+		e.WABefore, e.QtyBefore, e.Price, e.Quantity, e.Precision, e.Currency, now)
+	if err != nil {
+		return nil, false, apierror.NewAPIError(apierror.ErrInternalServer, "Failed to begin settlement journal", err)
+	}
+	existing, err := d.GetSettlementJournal(ctx, e.SecurityTxnID)
+	if err != nil {
+		return nil, false, err
+	}
+	created := false
+	if n, e2 := res.RowsAffected(); e2 == nil && n == 1 {
+		created = true
+	}
+	return existing, created, nil
+}
+
+// GetSettlementJournal fetches a journal row, or NotFound.
+func (d Datasource) GetSettlementJournal(ctx context.Context, securityTxnID string) (*model.SettlementJournalEntry, error) {
+	row := d.Conn.QueryRowContext(ctx, `SELECT `+journalColumns+`
+        FROM blnk.brokerage_settlement_journal WHERE security_txn_id = $1`, securityTxnID)
+	e, err := scanJournal(row)
+	if err == sql.ErrNoRows {
+		return nil, apierror.NewAPIError(apierror.ErrNotFound, fmt.Sprintf("No settlement journal for '%s'", securityTxnID), err)
+	}
+	if err != nil {
+		return nil, apierror.NewAPIError(apierror.ErrInternalServer, "Failed to scan settlement journal", err)
+	}
+	return e, nil
+}
+
+// CompleteSettlementJournal applies the side effects of a settled buy leg in a
+// single DB transaction: an idempotent purchase lot, the new wa_price on the
+// spot balance, and the journal flipped to 'applied'. Safe to call repeatedly.
+func (d Datasource) CompleteSettlementJournal(ctx context.Context, securityTxnID, waAfter string, lot model.BalanceLot) (string, error) {
+	tx, err := d.Conn.BeginTx(ctx, nil)
+	if err != nil {
+		return "", apierror.NewAPIError(apierror.ErrInternalServer, "Failed to begin journal completion", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	lotID := ""
+	if lot.Quantity != nil && lot.Quantity.Sign() > 0 {
+		if lot.Precision < 1 {
+			lot.Precision = 1
+		}
+		newLotID := model.GenerateUUIDWithSuffix("lot")
+		if lot.PurchasedAt.IsZero() {
+			lot.PurchasedAt = time.Now()
+		}
+		// Idempotent on (balance_id, reference): a retry returns the existing lot id.
+		err = tx.QueryRowContext(ctx, `
+            INSERT INTO blnk.balance_lots
+                (lot_id, balance_id, instrument, quantity, precision, price, currency, reference, purchased_at, created_at)
+            VALUES ($1,$2,$3,$4,$5,$6::numeric,$7,$8,$9,$10)
+            ON CONFLICT (balance_id, reference) WHERE reference IS NOT NULL AND reference <> ''
+            DO UPDATE SET lot_id = blnk.balance_lots.lot_id
+            RETURNING lot_id`,
+			newLotID, lot.BalanceID, lot.Instrument, lot.Quantity.String(), lot.Precision,
+			lot.Price, lot.Currency, lot.Reference, lot.PurchasedAt, time.Now()).Scan(&lotID)
+		if err != nil {
+			return "", apierror.NewAPIError(apierror.ErrInternalServer, "Failed to upsert lot", err)
+		}
+	}
+
+	if waAfter != "" {
+		if _, err = tx.ExecContext(ctx, `
+            UPDATE blnk.balances SET wa_price = $2::numeric, version = version + 1
+            WHERE balance_id = $1`, lot.BalanceID, waAfter); err != nil {
+			return "", apierror.NewAPIError(apierror.ErrInternalServer, "Failed to update wa price", err)
+		}
+	}
+
+	if _, err = tx.ExecContext(ctx, `
+        UPDATE blnk.brokerage_settlement_journal
+        SET status = 'applied', wa_after = NULLIF($2,'')::numeric, lot_id = NULLIF($3,''), updated_at = NOW()
+        WHERE security_txn_id = $1`, securityTxnID, waAfter, lotID); err != nil {
+		return "", apierror.NewAPIError(apierror.ErrInternalServer, "Failed to mark journal applied", err)
+	}
+
+	if err = tx.Commit(); err != nil {
+		return "", apierror.NewAPIError(apierror.ErrInternalServer, "Failed to commit journal completion", err)
+	}
+	return lotID, nil
+}
+
+// ListPendingSettlementJournals returns journal rows still awaiting their side
+// effects (recovery candidates).
+func (d Datasource) ListPendingSettlementJournals(ctx context.Context, limit int) ([]model.SettlementJournalEntry, error) {
+	rows, err := d.Conn.QueryContext(ctx, `SELECT `+journalColumns+`
+        FROM blnk.brokerage_settlement_journal WHERE status = 'pending'
+        ORDER BY created_at ASC LIMIT $1`, limit)
+	if err != nil {
+		return nil, apierror.NewAPIError(apierror.ErrInternalServer, "Failed to query pending journals", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var out []model.SettlementJournalEntry
+	for rows.Next() {
+		e, err := scanJournal(rows)
+		if err != nil {
+			return nil, apierror.NewAPIError(apierror.ErrInternalServer, "Failed to scan pending journal", err)
+		}
+		out = append(out, *e)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, apierror.NewAPIError(apierror.ErrInternalServer, "Failed to iterate pending journals", err)
+	}
+	return out, nil
 }

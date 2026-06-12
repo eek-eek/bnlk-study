@@ -300,6 +300,40 @@ func TestSellTrade_RejectsWhenExceedingTradableOnTheWay(t *testing.T) {
 	datasource.AssertNotCalled(t, "RecordTransaction", mock.Anything, mock.Anything)
 }
 
+func TestReconcileSettlement_RecomputesAndCompletes(t *testing.T) {
+	service, datasource, cleanup := newBrokerageTestBlnk(t)
+	defer cleanup()
+
+	// One pending journal: spot had 100 @ 150 (precise, precision 1), buy 50 @ 180.
+	// wa_after = (50*180 + 150*100) / 150 = 24000/150 = 160.00.
+	pending := model.SettlementJournalEntry{
+		SecurityTxnID: "txn_sec",
+		TradeRef:      "buy-50",
+		SpotBalanceID: "bln_spot",
+		Instrument:    "AAPL",
+		Side:          model.TradeSideBuy,
+		WABefore:      "150.00",
+		QtyBefore:     "100",
+		Price:         "180",
+		Quantity:      "50",
+		Precision:     1,
+		Currency:      "USD",
+		Status:        model.SettlementPending,
+	}
+	datasource.On("ListPendingSettlementJournals", mock.Anything, mock.Anything).
+		Return([]model.SettlementJournalEntry{pending}, nil)
+	datasource.On("CompleteSettlementJournal", mock.Anything, "txn_sec", "160.00",
+		mock.MatchedBy(func(lot model.BalanceLot) bool {
+			return lot.BalanceID == "bln_spot" && lot.Reference == "buy-50" &&
+				lot.Quantity.Int64() == 50 && lot.Price == "180"
+		})).Return("lot_1", nil)
+
+	n, err := service.ReconcileSettlement(context.Background(), 10)
+	assert.NoError(t, err)
+	assert.Equal(t, 1, n)
+	datasource.AssertExpectations(t)
+}
+
 func TestComputeSettleDate_EmptyVenueSkipsCalendarLookup(t *testing.T) {
 	service, datasource, cleanup := newBrokerageTestBlnk(t)
 	defer cleanup()

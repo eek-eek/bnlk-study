@@ -824,3 +824,32 @@ func (m *MockDataSource) GetInstrumentSettings(ctx context.Context, instrument s
 	}
 	return args.Get(0).(*model.InstrumentSettings), args.Error(1)
 }
+
+func (m *MockDataSource) BeginSettlementJournal(ctx context.Context, e model.SettlementJournalEntry) (*model.SettlementJournalEntry, bool, error) {
+	args := m.Called(ctx, e)
+	if args.Get(0) == nil {
+		return nil, args.Bool(1), args.Error(2)
+	}
+	return args.Get(0).(*model.SettlementJournalEntry), args.Bool(1), args.Error(2)
+}
+
+func (m *MockDataSource) GetSettlementJournal(ctx context.Context, securityTxnID string) (*model.SettlementJournalEntry, error) {
+	args := m.Called(ctx, securityTxnID)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).(*model.SettlementJournalEntry), args.Error(1)
+}
+
+func (m *MockDataSource) CompleteSettlementJournal(ctx context.Context, securityTxnID, waAfter string, lot model.BalanceLot) (string, error) {
+	args := m.Called(ctx, securityTxnID, waAfter, lot)
+	return args.String(0), args.Error(1)
+}
+
+func (m *MockDataSource) ListPendingSettlementJournals(ctx context.Context, limit int) ([]model.SettlementJournalEntry, error) {
+	args := m.Called(ctx, limit)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).([]model.SettlementJournalEntry), args.Error(1)
+}

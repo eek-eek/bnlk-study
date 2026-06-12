@@ -18,6 +18,7 @@ package database
 import (
 	"context"
 	"math/big"
+	"os"
 	"testing"
 	"time"
 
@@ -452,4 +453,37 @@ func TestGetMaturedPositions(t *testing.T) {
 	assert.Len(t, matured, 1)
 	assert.Equal(t, "bln_matured", matured[0].BalanceID)
 	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestGetPendingInflightByBalance_BigPreciseAmount(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	assert.NoError(t, err)
+	defer func() { _ = db.Close() }()
+	ds := Datasource{Conn: db}
+
+	// precise_amount larger than int64 max (9.22e18) must survive as big.Int.
+	big1 := "99999999999999999999999999"
+	mock.ExpectQuery(`FROM blnk.transactions`).
+		WithArgs("bln_1").
+		WillReturnRows(sqlmock.NewRows([]string{
+			"transaction_id", "parent_transaction", "source", "reference", "amount",
+			"precise_amount", "precision", "currency", "destination", "description",
+			"status", "created_at", "meta_data",
+		}).AddRow("txn_1", "", "bln_1", "ref", "1", big1, float64(1), "USD", "bln_2", "d",
+			"INFLIGHT", time.Now(), []byte(`{}`)))
+
+	txns, err := ds.GetPendingInflightByBalance(context.Background(), "bln_1")
+	assert.NoError(t, err)
+	assert.Len(t, txns, 1)
+	expected, _ := new(big.Int).SetString(big1, 10)
+	assert.Equal(t, 0, txns[0].PreciseAmount.Cmp(expected), "precise_amount must round-trip without int64 overflow")
+}
+
+// TestBrokerageQueriesUseSettleDate guards against regressing to the settle_code
+// predicate that excluded explicit-settle_date (settle_code NULL) buckets.
+func TestBrokerageQueriesUseSettleDate(t *testing.T) {
+	src, err := os.ReadFile("brokerage.go")
+	assert.NoError(t, err)
+	assert.NotContains(t, string(src), "settle_code IS NOT NULL",
+		"brokerage queries must filter future buckets by settle_date, not settle_code")
 }

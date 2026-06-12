@@ -31,9 +31,12 @@ import (
 
 	"github.com/blnkfinance/blnk/internal/apierror"
 	redlock "github.com/blnkfinance/blnk/internal/lock"
+	"github.com/blnkfinance/blnk/internal/metrics"
 	"github.com/blnkfinance/blnk/model"
 	"github.com/shopspring/decimal"
 	"github.com/sirupsen/logrus"
+	"go.opentelemetry.io/otel/attribute"
+	otelmetric "go.opentelemetry.io/otel/metric"
 	"golang.org/x/sync/semaphore"
 )
 
@@ -250,6 +253,9 @@ func (l *Blnk) SellTrade(ctx context.Context, booking model.SellBooking) (*model
 	}
 	qtyPrecise := model.ApplyPrecision(&model.Transaction{Amount: booking.Quantity, Precision: booking.QuantityPrecision})
 	if qtyPrecise.Cmp(tradable.Tradable) > 0 {
+		metrics.BrokerageSellRejectedTotal.Add(ctx, 1, otelmetric.WithAttributes(
+			attribute.String("reason", "insufficient_tradable"),
+			attribute.String("instrument", booking.Instrument)))
 		return nil, apierror.NewAPIError(apierror.ErrBadRequest, fmt.Sprintf(
 			"insufficient tradable quantity for %s: requested %v, available %s (settled %s, blocked %s, incoming %s, outgoing %s, on_the_way %t)",
 			booking.Instrument, booking.Quantity, tradable.Tradable.String(),
@@ -352,6 +358,9 @@ func (l *Blnk) SellTrade(ctx context.Context, booking model.SellBooking) (*model
 		return nil, fmt.Errorf("failed to book sell security leg: %w", err)
 	}
 
+	metrics.BrokerageTradeBookedTotal.Add(ctx, 1, otelmetric.WithAttributes(
+		attribute.String("side", model.TradeSideSell),
+		attribute.String("instrument", booking.Instrument)))
 	return &model.SellBookingResult{
 		TradeRef:          booking.Reference,
 		MoneyTxnID:        recordedMoney.TransactionID,
@@ -578,6 +587,9 @@ func (l *Blnk) BookTrade(ctx context.Context, booking model.TradeBooking) (*mode
 		return nil, fmt.Errorf("failed to book security leg: %w", err)
 	}
 
+	metrics.BrokerageTradeBookedTotal.Add(ctx, 1, otelmetric.WithAttributes(
+		attribute.String("side", model.TradeSideBuy),
+		attribute.String("instrument", booking.Instrument)))
 	return &model.TradeBookingResult{
 		TradeRef:          booking.Reference,
 		MoneyTxnID:        recordedMoney.TransactionID,
@@ -850,6 +862,9 @@ func (l *Blnk) ReconcileSettlement(ctx context.Context, limit int) (int, error) 
 		}
 		reconciled++
 	}
+	if reconciled > 0 {
+		metrics.BrokerageReconciledTotal.Add(ctx, int64(reconciled))
+	}
 	return reconciled, nil
 }
 
@@ -900,6 +915,8 @@ func (l *Blnk) RunSettlement(ctx context.Context, asOf time.Time, limit int) (*m
 	if limit <= 0 {
 		limit = defaultSettlementBatch
 	}
+	start := time.Now()
+	metrics.BrokerageSettlementRunTotal.Add(ctx, 1)
 	// Finish any side effects left pending by a previously interrupted run.
 	if n, err := l.ReconcileSettlement(ctx, limit); err != nil {
 		logrus.WithError(err).Warn("settlement reconcile pass failed")
@@ -921,5 +938,12 @@ func (l *Blnk) RunSettlement(ctx context.Context, asOf time.Time, limit int) (*m
 		}
 		result.Settled = append(result.Settled, settled...)
 	}
+
+	metrics.BrokerageMaturedBucketsExamined.Record(ctx, int64(result.Examined))
+	metrics.BrokerageSettledTradesTotal.Add(ctx, int64(len(result.Settled)))
+	if len(result.Errors) > 0 {
+		metrics.BrokerageSettlementErrorsTotal.Add(ctx, int64(len(result.Errors)))
+	}
+	metrics.BrokerageSettlementDuration.Record(ctx, time.Since(start).Seconds())
 	return result, nil
 }

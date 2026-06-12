@@ -258,6 +258,85 @@ func (r RecalculateHoldsRequest) ValidateRecalculateHolds() error {
 	)
 }
 
+// InstrumentSettingsRequest configures the trading mode of an instrument.
+type InstrumentSettingsRequest struct {
+	Instrument     string `json:"instrument"`
+	Venue          string `json:"venue"`
+	TradesOnTheWay bool   `json:"trades_on_the_way"`
+	SettleOffset   int    `json:"settle_offset"`
+}
+
+// ToInstrumentSettings converts and validates the request.
+func (i InstrumentSettingsRequest) ToInstrumentSettings() (model.InstrumentSettings, error) {
+	if err := validation.ValidateStruct(&i,
+		validation.Field(&i.Instrument, validation.Required),
+		validation.Field(&i.SettleOffset, validation.Min(0)),
+	); err != nil {
+		return model.InstrumentSettings{}, err
+	}
+	if i.TradesOnTheWay && i.SettleOffset == 0 {
+		return model.InstrumentSettings{}, fmt.Errorf("settle_offset must be > 0 when trades_on_the_way is true")
+	}
+	return model.InstrumentSettings{
+		Instrument:     i.Instrument,
+		Venue:          i.Venue,
+		TradesOnTheWay: i.TradesOnTheWay,
+		SettleOffset:   i.SettleOffset,
+	}, nil
+}
+
+// SellTradeRequest books a sell trade (delivery hold + money credit).
+type SellTradeRequest struct {
+	LedgerID   string `json:"ledger_id"`
+	IdentityID string `json:"identity_id"`
+	AccountRef string `json:"account_ref"`
+
+	Instrument string `json:"instrument"`
+	Venue      string `json:"venue"`
+	Currency   string `json:"currency"`
+
+	Quantity          float64 `json:"quantity"`
+	QuantityPrecision float64 `json:"quantity_precision"`
+	Price             string  `json:"price"`
+	MoneyPrecision    float64 `json:"money_precision"`
+
+	SettleOffset int    `json:"settle_offset"`
+	TradeDate    string `json:"trade_date"`
+
+	SettlementBalanceID string `json:"settlement_balance_id"`
+	MarketBalanceID     string `json:"market_balance_id"`
+
+	Reference string `json:"reference"`
+}
+
+// ToSellBooking converts the request into the domain booking.
+func (s SellTradeRequest) ToSellBooking() (model.SellBooking, error) {
+	booking := model.SellBooking{
+		LedgerID:            s.LedgerID,
+		IdentityID:          s.IdentityID,
+		AccountRef:          s.AccountRef,
+		Instrument:          s.Instrument,
+		Venue:               s.Venue,
+		Currency:            s.Currency,
+		Quantity:            s.Quantity,
+		QuantityPrecision:   s.QuantityPrecision,
+		Price:               s.Price,
+		MoneyPrecision:      s.MoneyPrecision,
+		SettleOffset:        s.SettleOffset,
+		SettlementBalanceID: s.SettlementBalanceID,
+		MarketBalanceID:     s.MarketBalanceID,
+		Reference:           s.Reference,
+	}
+	if s.TradeDate != "" {
+		parsed, err := time.Parse(model.HolidayKeyFormat, s.TradeDate)
+		if err != nil {
+			return model.SellBooking{}, fmt.Errorf("invalid trade_date %q, expected YYYY-MM-DD", s.TradeDate)
+		}
+		booking.TradeDate = parsed
+	}
+	return booking, booking.Validate()
+}
+
 // RunSettlementRequest triggers a settlement pass.
 type RunSettlementRequest struct {
 	AsOf  string `json:"as_of"`

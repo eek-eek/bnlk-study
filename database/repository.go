@@ -208,6 +208,10 @@ type brokerage interface {
 	ApplyBalanceDeltas(ctx context.Context, deltas []model.BalanceDelta) error                                                                       // Applies a normalized mutation plan atomically
 	RecomputeHolds(ctx context.Context, balanceID string) (*big.Int, *big.Int, error)                                                                // Rebuilds blocked/waiting holds from live INFLIGHT transactions
 	GetPendingInflightByDestination(ctx context.Context, balanceID string) ([]*model.Transaction, error)                                             // Lists pending inflight transactions destined to a balance
+	GetPendingInflightByBalance(ctx context.Context, balanceID string) ([]*model.Transaction, error)                                                 // Lists pending inflight transactions touching a balance on either side
+	SumFutureHolds(ctx context.Context, ledgerID, identityID, accountRef, instrument, currency string, asOfSettleDate time.Time) (*big.Int, *big.Int, error) // Aggregates in-transit incoming/outgoing maturing by a date
+	UpsertInstrumentSettings(ctx context.Context, settings model.InstrumentSettings) (model.InstrumentSettings, error)                               // Stores the trading mode of an instrument
+	GetInstrumentSettings(ctx context.Context, instrument string) (*model.InstrumentSettings, error)                                                 // Retrieves the trading mode of an instrument
 	UpdateWAPrice(ctx context.Context, balanceID, waPrice string) error                                                                              // Stores the weighted-average price
 	CreateLot(ctx context.Context, lot model.BalanceLot) (model.BalanceLot, error)                                                                   // Records a purchase lot
 	GetLots(ctx context.Context, balanceID string) ([]model.BalanceLot, error)                                                                       // Lists purchase lots of a balance

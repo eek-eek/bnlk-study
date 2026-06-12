@@ -213,6 +213,71 @@ type MarketHoliday struct {
 // HolidayKeyFormat is the map key layout used by ComputeSettleDate.
 const HolidayKeyFormat = "2006-01-02"
 
+// InstrumentSettings carries the per-instrument trading mode. TradesOnTheWay
+// marks an instrument that settles on a T+SettleOffset cycle and may be traded
+// while quantity is still in transit (TradeControl board "trades on the way"
+// flag). When it is false (or no settings exist) future incoming/outgoing is
+// not counted as tradable: only the settled position can be sold.
+type InstrumentSettings struct {
+	ID              int64     `json:"id"`
+	Instrument      string    `json:"instrument"`
+	Venue           string    `json:"venue,omitempty"`
+	TradesOnTheWay  bool      `json:"trades_on_the_way"`
+	SettleOffset    int       `json:"settle_offset"`
+	CreatedAt       time.Time `json:"created_at"`
+	UpdatedAt       time.Time `json:"updated_at"`
+}
+
+// TradablePosition is the settle-date-aware answer to "how much can be sold".
+// For an on-the-way instrument it nets the settled position with the
+// in-transit incoming/outgoing maturing on or before the trade settle date;
+// for an immediate-settlement instrument it reports only the settled, unblocked
+// position (TradeControl FreeBalance for securities).
+type TradablePosition struct {
+	Settled    *big.Int `json:"settled"`     // spot balance
+	Blocked    *big.Int `json:"blocked"`     // spot inflight debit (already-committed outflows)
+	Incoming   *big.Int `json:"incoming"`    // future inflight credit counted (0 if not on-the-way)
+	Outgoing   *big.Int `json:"outgoing"`    // future inflight debit counted (0 if not on-the-way)
+	Tradable   *big.Int `json:"tradable"`    // amount available to sell
+	OnTheWay   bool     `json:"on_the_way"`  // whether in-transit quantity was considered
+	AsOfSettle string   `json:"as_of_settle"`
+}
+
+// ComputeTradable applies the TradeControl settle-date arithmetic:
+//
+//	on-the-way:  tradable = settled - blocked + incoming - outgoing
+//	immediate:   tradable = settled - blocked
+//
+// A negative result is clamped to zero.
+func ComputeTradable(settled, blocked, incoming, outgoing *big.Int, onTheWay bool) *big.Int {
+	tradable := new(big.Int).Sub(nz(settled), nz(blocked))
+	if onTheWay {
+		tradable.Add(tradable, nz(incoming))
+		tradable.Sub(tradable, nz(outgoing))
+	}
+	if tradable.Sign() < 0 {
+		return big.NewInt(0)
+	}
+	return tradable
+}
+
+// nz returns a zero big.Int for nil inputs.
+func nz(v *big.Int) *big.Int {
+	if v == nil {
+		return big.NewInt(0)
+	}
+	return v
+}
+
+// Trade sides.
+const (
+	TradeSideBuy  = "buy"
+	TradeSideSell = "sell"
+)
+
+// TradeMetaSide is the metadata key carrying the trade side.
+const TradeMetaSide = "trade_side"
+
 // IsSettlementDay reports whether the given date counts as a settlement day:
 // not a weekend and not a venue holiday (TradeControl HolidayService rule:
 // weekends and venue holidays are not settlement days).
@@ -400,6 +465,81 @@ type TradeBookingResult struct {
 	MoneyBalanceID    string    `json:"money_balance_id"`
 	PositionBalanceID string    `json:"position_balance_id"`
 	SettleDate        time.Time `json:"settle_date"`
+}
+
+// SellBooking describes a sell trade. The legs mirror a buy: securities flow
+// out of the client position to the market counterparty (a hold that reduces
+// the tradable position) and money flows in from settlement. The available
+// quantity is validated with the settle-date-aware tradable arithmetic before
+// the holds are placed.
+type SellBooking struct {
+	LedgerID   string `json:"ledger_id"`
+	IdentityID string `json:"identity_id"`
+	AccountRef string `json:"account_ref"`
+
+	Instrument string `json:"instrument"`
+	Venue      string `json:"venue"`
+	Currency   string `json:"currency"`
+
+	Quantity          float64 `json:"quantity"`
+	QuantityPrecision float64 `json:"quantity_precision"`
+	Price             string  `json:"price"`
+	MoneyPrecision    float64 `json:"money_precision"`
+
+	// SettleOffset is the requested T+N; it is overridden by the instrument
+	// settings when those exist.
+	SettleOffset int       `json:"settle_offset"`
+	TradeDate    time.Time `json:"trade_date"`
+
+	// SettlementBalanceID is the broker settlement balance funding the proceeds.
+	SettlementBalanceID string `json:"settlement_balance_id"`
+	// MarketBalanceID is the counterparty securities balance receiving delivery.
+	MarketBalanceID string `json:"market_balance_id"`
+
+	Reference string `json:"reference"`
+}
+
+// Validate checks the sell booking invariants.
+func (s SellBooking) Validate() error {
+	if s.LedgerID == "" || s.AccountRef == "" || s.Currency == "" {
+		return fmt.Errorf("sell booking: ledger_id, account_ref and currency are required")
+	}
+	if s.Instrument == "" {
+		return fmt.Errorf("sell booking: instrument is required")
+	}
+	if s.Quantity <= 0 {
+		return fmt.Errorf("sell booking: quantity must be positive")
+	}
+	if s.QuantityPrecision < 1 {
+		return fmt.Errorf("sell booking: quantity_precision must be >= 1")
+	}
+	if s.MoneyPrecision < 1 {
+		return fmt.Errorf("sell booking: money_precision must be >= 1")
+	}
+	if _, err := decimal.NewFromString(s.Price); err != nil {
+		return fmt.Errorf("sell booking: invalid price %q: %w", s.Price, err)
+	}
+	if s.SettleOffset < 0 {
+		return fmt.Errorf("sell booking: settle_offset must be >= 0")
+	}
+	if s.SettlementBalanceID == "" || s.MarketBalanceID == "" {
+		return fmt.Errorf("sell booking: settlement_balance_id and market_balance_id are required")
+	}
+	if s.Reference == "" {
+		return fmt.Errorf("sell booking: reference is required")
+	}
+	return nil
+}
+
+// SellBookingResult reports the artifacts created by SellTrade.
+type SellBookingResult struct {
+	TradeRef          string           `json:"trade_ref"`
+	MoneyTxnID        string           `json:"money_txn_id"`
+	SecurityTxnID     string           `json:"security_txn_id"`
+	MoneyBalanceID    string           `json:"money_balance_id"`
+	PositionBalanceID string           `json:"position_balance_id"`
+	SettleDate        time.Time        `json:"settle_date"`
+	Tradable          TradablePosition `json:"tradable"`
 }
 
 // TradeSettlementResult reports the artifacts of settling one trade.

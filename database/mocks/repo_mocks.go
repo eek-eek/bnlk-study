@@ -795,3 +795,32 @@ func (m *MockDataSource) GetHolidays(ctx context.Context, venue string, from, to
 	}
 	return args.Get(0).([]model.MarketHoliday), args.Error(1)
 }
+
+func (m *MockDataSource) GetPendingInflightByBalance(ctx context.Context, balanceID string) ([]*model.Transaction, error) {
+	args := m.Called(ctx, balanceID)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).([]*model.Transaction), args.Error(1)
+}
+
+func (m *MockDataSource) SumFutureHolds(ctx context.Context, ledgerID, identityID, accountRef, instrument, currency string, asOfSettleDate time.Time) (*big.Int, *big.Int, error) {
+	args := m.Called(ctx, ledgerID, identityID, accountRef, instrument, currency, asOfSettleDate)
+	if args.Get(0) == nil {
+		return nil, nil, args.Error(2)
+	}
+	return args.Get(0).(*big.Int), args.Get(1).(*big.Int), args.Error(2)
+}
+
+func (m *MockDataSource) UpsertInstrumentSettings(ctx context.Context, settings model.InstrumentSettings) (model.InstrumentSettings, error) {
+	args := m.Called(ctx, settings)
+	return args.Get(0).(model.InstrumentSettings), args.Error(1)
+}
+
+func (m *MockDataSource) GetInstrumentSettings(ctx context.Context, instrument string) (*model.InstrumentSettings, error) {
+	args := m.Called(ctx, instrument)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).(*model.InstrumentSettings), args.Error(1)
+}

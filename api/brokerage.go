@@ -158,6 +158,110 @@ func (a Api) GetActivePosition(c *gin.Context) {
 	c.JSON(http.StatusOK, resp)
 }
 
+// SetInstrumentSettings configures the trading mode of an instrument.
+func (a Api) SetInstrumentSettings(c *gin.Context) {
+	var request model2.InstrumentSettingsRequest
+	if err := c.ShouldBindJSON(&request); err != nil {
+		respondCode(c, apierror.ErrGenMalformedRequest, err.Error(), nil)
+		return
+	}
+	settings, err := request.ToInstrumentSettings()
+	if err != nil {
+		respondCode(c, apierror.ErrGenValidation, err.Error(), nil)
+		return
+	}
+	resp, err := a.blnk.SetInstrumentSettings(c.Request.Context(), settings)
+	if err != nil {
+		respondError(c, err)
+		return
+	}
+	c.JSON(http.StatusCreated, resp)
+}
+
+// GetInstrumentSettings returns the trading mode of an instrument.
+func (a Api) GetInstrumentSettings(c *gin.Context) {
+	instrument, passed := c.Params.Get("instrument")
+	if !passed {
+		respondCode(c, apierror.ErrGenValidation, "instrument is required. pass it in the route /brokerage/instruments/:instrument", nil)
+		return
+	}
+	resp, err := a.blnk.GetInstrumentSettings(c.Request.Context(), instrument)
+	if err != nil {
+		respondError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, resp)
+}
+
+// GetTradablePosition returns the settle-date-aware quantity available to sell.
+// The settle date is resolved from the instrument's configured T+N cycle and
+// the venue holiday calendar.
+func (a Api) GetTradablePosition(c *gin.Context) {
+	ledgerID := c.Query("ledger_id")
+	accountRef := c.Query("account_ref")
+	instrument := c.Query("instrument")
+	currency := c.Query("currency")
+	if ledgerID == "" || accountRef == "" || instrument == "" || currency == "" {
+		respondCode(c, apierror.ErrGenValidation, "ledger_id, account_ref, instrument and currency query parameters are required", nil)
+		return
+	}
+
+	tradeDate := time.Now()
+	if raw := c.Query("trade_date"); raw != "" {
+		parsed, err := time.Parse(model.HolidayKeyFormat, raw)
+		if err != nil {
+			respondCode(c, apierror.ErrGenValidation, "invalid trade_date, expected YYYY-MM-DD", nil)
+			return
+		}
+		tradeDate = parsed
+	}
+
+	settings, err := a.blnk.GetInstrumentSettings(c.Request.Context(), instrument)
+	venue := c.Query("venue")
+	settleOffset := 0
+	if err == nil {
+		if settings.TradesOnTheWay {
+			settleOffset = settings.SettleOffset
+		}
+		if settings.Venue != "" {
+			venue = settings.Venue
+		}
+	}
+	settleDate, err := a.blnk.ComputeSettleDate(c.Request.Context(), venue, tradeDate, settleOffset)
+	if err != nil {
+		respondError(c, err)
+		return
+	}
+
+	resp, err := a.blnk.GetTradablePosition(c.Request.Context(), ledgerID, c.Query("identity_id"),
+		accountRef, instrument, currency, settleDate)
+	if err != nil {
+		respondError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, resp)
+}
+
+// SellTrade books a sell trade after the settle-date-aware availability check.
+func (a Api) SellTrade(c *gin.Context) {
+	var request model2.SellTradeRequest
+	if err := c.ShouldBindJSON(&request); err != nil {
+		respondCode(c, apierror.ErrGenMalformedRequest, err.Error(), nil)
+		return
+	}
+	booking, err := request.ToSellBooking()
+	if err != nil {
+		respondCode(c, apierror.ErrGenValidation, err.Error(), nil)
+		return
+	}
+	resp, err := a.blnk.SellTrade(c.Request.Context(), booking)
+	if err != nil {
+		respondError(c, err)
+		return
+	}
+	c.JSON(http.StatusCreated, resp)
+}
+
 // BookTrade books a buy trade: money hold + future security position.
 func (a Api) BookTrade(c *gin.Context) {
 	var request model2.BookTradeRequest

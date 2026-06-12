@@ -605,6 +605,137 @@ func (d Datasource) GetLots(ctx context.Context, balanceID string) ([]model.Bala
 	return lots, nil
 }
 
+// UpsertInstrumentSettings stores (or updates) the trading mode of an
+// instrument.
+func (d Datasource) UpsertInstrumentSettings(ctx context.Context, settings model.InstrumentSettings) (model.InstrumentSettings, error) {
+	if settings.Instrument == "" {
+		return model.InstrumentSettings{}, apierror.NewAPIError(apierror.ErrBadRequest, "Instrument is required", nil)
+	}
+	if settings.SettleOffset < 0 {
+		return model.InstrumentSettings{}, apierror.NewAPIError(apierror.ErrBadRequest, "settle_offset must be >= 0", nil)
+	}
+	now := time.Now()
+	var venue interface{} = settings.Venue
+	if settings.Venue == "" {
+		venue = nil
+	}
+	err := d.Conn.QueryRowContext(ctx, `
+        INSERT INTO blnk.instrument_settings (instrument, venue, trades_on_the_way, settle_offset, created_at, updated_at)
+        VALUES ($1, $2, $3, $4, $5, $5)
+        ON CONFLICT (instrument) DO UPDATE
+            SET venue = EXCLUDED.venue, trades_on_the_way = EXCLUDED.trades_on_the_way,
+                settle_offset = EXCLUDED.settle_offset, updated_at = EXCLUDED.updated_at
+        RETURNING id, created_at, updated_at`,
+		settings.Instrument, venue, settings.TradesOnTheWay, settings.SettleOffset, now,
+	).Scan(&settings.ID, &settings.CreatedAt, &settings.UpdatedAt)
+	if err != nil {
+		return model.InstrumentSettings{}, apierror.NewAPIError(apierror.ErrInternalServer, "Failed to upsert instrument settings", err)
+	}
+	return settings, nil
+}
+
+// GetInstrumentSettings returns the trading mode of an instrument, or a
+// NotFound error when none is configured.
+func (d Datasource) GetInstrumentSettings(ctx context.Context, instrument string) (*model.InstrumentSettings, error) {
+	settings := &model.InstrumentSettings{}
+	var venue sql.NullString
+	err := d.Conn.QueryRowContext(ctx, `
+        SELECT id, instrument, COALESCE(venue, ''), trades_on_the_way, settle_offset, created_at, updated_at
+        FROM blnk.instrument_settings WHERE instrument = $1`, instrument,
+	).Scan(&settings.ID, &settings.Instrument, &venue, &settings.TradesOnTheWay,
+		&settings.SettleOffset, &settings.CreatedAt, &settings.UpdatedAt)
+	if err == sql.ErrNoRows {
+		return nil, apierror.NewAPIError(apierror.ErrNotFound, fmt.Sprintf("No settings configured for instrument '%s'", instrument), err)
+	}
+	if err != nil {
+		return nil, apierror.NewAPIError(apierror.ErrInternalServer, "Failed to scan instrument settings", err)
+	}
+	settings.Venue = venue.String
+	return settings, nil
+}
+
+// SumFutureHolds aggregates the in-transit incoming (inflight credit) and
+// outgoing (inflight debit) quantity across the future balances of a position
+// that settle on or before asOfSettleDate. It is the in-transit term of the
+// tradable arithmetic for on-the-way instruments.
+func (d Datasource) SumFutureHolds(ctx context.Context, ledgerID, identityID, accountRef, instrument, currency string, asOfSettleDate time.Time) (*big.Int, *big.Int, error) {
+	row := d.Conn.QueryRowContext(ctx, `
+        SELECT COALESCE(SUM(b.inflight_credit_balance), 0)::text,
+               COALESCE(SUM(b.inflight_debit_balance), 0)::text
+        FROM blnk.balances b
+        WHERE b.ledger_id = $1 AND COALESCE(b.identity_id, '') = $2 AND b.account_ref = $3
+          AND COALESCE(b.instrument, '') = $4 AND b.currency = $5
+          AND b.settle_code IS NOT NULL AND b.settle_date <= $6`,
+		ledgerID, identityID, accountRef, instrument, currency, asOfSettleDate)
+
+	var incomingStr, outgoingStr string
+	if err := row.Scan(&incomingStr, &outgoingStr); err != nil {
+		return nil, nil, apierror.NewAPIError(apierror.ErrInternalServer, "Failed to sum future holds", err)
+	}
+	incoming, ok := new(big.Int).SetString(incomingStr, 10)
+	if !ok {
+		return nil, nil, apierror.NewAPIError(apierror.ErrInternalServer, fmt.Sprintf("Invalid incoming hold sum %q", incomingStr), nil)
+	}
+	outgoing, ok := new(big.Int).SetString(outgoingStr, 10)
+	if !ok {
+		return nil, nil, apierror.NewAPIError(apierror.ErrInternalServer, fmt.Sprintf("Invalid outgoing hold sum %q", outgoingStr), nil)
+	}
+	return incoming, outgoing, nil
+}
+
+// GetPendingInflightByBalance lists INFLIGHT transactions touching the balance
+// on either side (source or destination) that still hold a remaining amount.
+// Used by the settlement roll to find both incoming and outgoing trade legs of
+// a matured future balance.
+func (d Datasource) GetPendingInflightByBalance(ctx context.Context, balanceID string) ([]*model.Transaction, error) {
+	rows, err := d.Conn.QueryContext(ctx, `
+        SELECT t.transaction_id, t.parent_transaction, t.source, t.reference, t.amount,
+               t.precise_amount, t.precision, t.currency, t.destination, t.description,
+               t.status, t.created_at, t.meta_data
+        FROM blnk.transactions t
+        WHERE (t.source = $1 OR t.destination = $1)
+          AND t.status = 'INFLIGHT'
+          AND NOT EXISTS (
+              SELECT 1 FROM blnk.transactions v
+              WHERE v.parent_transaction = t.transaction_id AND v.status = 'VOID')
+          AND t.precise_amount > COALESCE((
+              SELECT SUM(c.precise_amount)
+              FROM blnk.transactions c
+              WHERE c.parent_transaction = t.transaction_id AND c.status = 'APPLIED'), 0)
+        ORDER BY t.created_at ASC`, balanceID)
+	if err != nil {
+		return nil, apierror.NewAPIError(apierror.ErrInternalServer, "Failed to query pending inflight transactions", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var transactions []*model.Transaction
+	for rows.Next() {
+		transaction := model.Transaction{}
+		var metaDataJSON []byte
+		var preciseAmount int64
+		err := rows.Scan(
+			&transaction.TransactionID, &transaction.ParentTransaction, &transaction.Source,
+			&transaction.Reference, &transaction.Amount, &preciseAmount, &transaction.Precision,
+			&transaction.Currency, &transaction.Destination, &transaction.Description,
+			&transaction.Status, &transaction.CreatedAt, &metaDataJSON,
+		)
+		if err != nil {
+			return nil, apierror.NewAPIError(apierror.ErrInternalServer, "Failed to scan pending inflight transaction", err)
+		}
+		transaction.PreciseAmount = big.NewInt(preciseAmount)
+		if len(metaDataJSON) > 0 {
+			if err := json.Unmarshal(metaDataJSON, &transaction.MetaData); err != nil {
+				return nil, apierror.NewAPIError(apierror.ErrInternalServer, "Failed to unmarshal transaction metadata", err)
+			}
+		}
+		transactions = append(transactions, &transaction)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, apierror.NewAPIError(apierror.ErrInternalServer, "Failed to iterate pending inflight transactions", err)
+	}
+	return transactions, nil
+}
+
 // CreateHoliday registers a non-settlement day for a venue.
 func (d Datasource) CreateHoliday(ctx context.Context, holiday model.MarketHoliday) (model.MarketHoliday, error) {
 	if holiday.Venue == "" {

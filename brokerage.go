@@ -29,6 +29,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/blnkfinance/blnk/internal/apierror"
 	redlock "github.com/blnkfinance/blnk/internal/lock"
 	"github.com/blnkfinance/blnk/model"
 	"github.com/shopspring/decimal"
@@ -101,6 +102,246 @@ func (l *Blnk) GetActivePosition(ctx context.Context, ledgerID, identityID, acco
 // GetBalanceLots lists the purchase lots of a balance (BalanceDetail analog).
 func (l *Blnk) GetBalanceLots(ctx context.Context, balanceID string) ([]model.BalanceLot, error) {
 	return l.datasource.GetLots(ctx, balanceID)
+}
+
+// SetInstrumentSettings stores the trading mode of an instrument.
+func (l *Blnk) SetInstrumentSettings(ctx context.Context, settings model.InstrumentSettings) (model.InstrumentSettings, error) {
+	return l.datasource.UpsertInstrumentSettings(ctx, settings)
+}
+
+// GetInstrumentSettings returns the trading mode of an instrument.
+func (l *Blnk) GetInstrumentSettings(ctx context.Context, instrument string) (*model.InstrumentSettings, error) {
+	return l.datasource.GetInstrumentSettings(ctx, instrument)
+}
+
+// tradeParams is the resolved trading mode for one trade.
+type tradeParams struct {
+	onTheWay     bool
+	settleOffset int
+	venue        string
+}
+
+// resolveTradeParams resolves the trading mode for an instrument. Configured
+// instrument settings win; otherwise the instrument is treated as
+// immediate-settlement (not on-the-way) and the caller-supplied offset/venue
+// are used. Crucially, an instrument with no "trades on the way" flag never
+// counts in-transit quantity as tradable — exactly the requested behavior.
+func (l *Blnk) resolveTradeParams(ctx context.Context, instrument string, requestedOffset int, requestedVenue string) (tradeParams, error) {
+	settings, err := l.datasource.GetInstrumentSettings(ctx, instrument)
+	if err != nil {
+		if apiErr, ok := err.(apierror.APIError); ok && apiErr.Code == apierror.ErrNotFound {
+			// No settings: immediate-settlement instrument. Future
+			// incoming/outgoing must not be counted as tradable.
+			return tradeParams{onTheWay: false, settleOffset: requestedOffset, venue: requestedVenue}, nil
+		}
+		return tradeParams{}, err
+	}
+	venue := settings.Venue
+	if venue == "" {
+		venue = requestedVenue
+	}
+	offset := settings.SettleOffset
+	if !settings.TradesOnTheWay {
+		// Immediate settlement: never carry future quantity, settle on the spot
+		// cycle even if a larger offset was configured.
+		offset = 0
+	}
+	return tradeParams{onTheWay: settings.TradesOnTheWay, settleOffset: offset, venue: venue}, nil
+}
+
+// GetTradablePosition computes how much of a security position can be sold by
+// the given settle date, applying the TradeControl settle-date arithmetic and
+// honoring the instrument's on-the-way flag. For an immediate-settlement
+// instrument only the settled, unblocked position is tradable; for an
+// on-the-way instrument the in-transit incoming/outgoing maturing by the
+// settle date is netted in.
+func (l *Blnk) GetTradablePosition(ctx context.Context, ledgerID, identityID, accountRef, instrument, currency string, asOfSettleDate time.Time) (*model.TradablePosition, error) {
+	settings, err := l.datasource.GetInstrumentSettings(ctx, instrument)
+	onTheWay := false
+	if err == nil {
+		onTheWay = settings.TradesOnTheWay
+	} else if apiErr, ok := err.(apierror.APIError); !ok || apiErr.Code != apierror.ErrNotFound {
+		return nil, err
+	}
+
+	settled := big.NewInt(0)
+	blocked := big.NewInt(0)
+	spot, err := l.datasource.GetPosition(ctx, model.PositionKey{
+		LedgerID: ledgerID, IdentityID: identityID, AccountRef: accountRef,
+		Instrument: instrument, Currency: currency,
+	})
+	if err == nil {
+		spot.InitializeBalanceFields()
+		settled = spot.Balance
+		blocked = spot.InflightDebitBalance
+	} else if apiErr, ok := err.(apierror.APIError); !ok || apiErr.Code != apierror.ErrNotFound {
+		return nil, err
+	}
+
+	incoming := big.NewInt(0)
+	outgoing := big.NewInt(0)
+	if onTheWay {
+		incoming, outgoing, err = l.datasource.SumFutureHolds(ctx, ledgerID, identityID, accountRef, instrument, currency, asOfSettleDate)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return &model.TradablePosition{
+		Settled:    settled,
+		Blocked:    blocked,
+		Incoming:   incoming,
+		Outgoing:   outgoing,
+		Tradable:   model.ComputeTradable(settled, blocked, incoming, outgoing, onTheWay),
+		OnTheWay:   onTheWay,
+		AsOfSettle: asOfSettleDate.Format(model.HolidayKeyFormat),
+	}, nil
+}
+
+// SellTrade books a sell trade after validating the settle-date-aware tradable
+// quantity. The security leg places an inflight delivery from the client
+// position to the market counterparty (reducing the tradable position) and the
+// money leg places an inflight credit of the proceeds. For an on-the-way
+// instrument the delivery is booked on the T+N future balance and may exceed
+// the settled spot quantity (covered by in-transit incoming); for an
+// immediate-settlement instrument only the settled position can be sold.
+func (l *Blnk) SellTrade(ctx context.Context, booking model.SellBooking) (*model.SellBookingResult, error) {
+	if err := booking.Validate(); err != nil {
+		return nil, err
+	}
+	tradeDate := booking.TradeDate
+	if tradeDate.IsZero() {
+		tradeDate = time.Now()
+	}
+
+	params, err := l.resolveTradeParams(ctx, booking.Instrument, booking.SettleOffset, booking.Venue)
+	if err != nil {
+		return nil, err
+	}
+	settleDate, err := l.ComputeSettleDate(ctx, params.venue, tradeDate, params.settleOffset)
+	if err != nil {
+		return nil, err
+	}
+
+	// Settle-date-aware availability check (the heart of the requirement).
+	tradable, err := l.GetTradablePosition(ctx, booking.LedgerID, booking.IdentityID,
+		booking.AccountRef, booking.Instrument, booking.Currency, settleDate)
+	if err != nil {
+		return nil, err
+	}
+	qtyPrecise := model.ApplyPrecision(&model.Transaction{Amount: booking.Quantity, Precision: booking.QuantityPrecision})
+	if qtyPrecise.Cmp(tradable.Tradable) > 0 {
+		return nil, apierror.NewAPIError(apierror.ErrBadRequest, fmt.Sprintf(
+			"insufficient tradable quantity for %s: requested %v, available %s (settled %s, blocked %s, incoming %s, outgoing %s, on_the_way %t)",
+			booking.Instrument, booking.Quantity, tradable.Tradable.String(),
+			tradable.Settled.String(), tradable.Blocked.String(), tradable.Incoming.String(),
+			tradable.Outgoing.String(), tradable.OnTheWay), nil)
+	}
+
+	moneyBalance, err := l.GetOrCreatePosition(ctx, model.PositionKey{
+		LedgerID:   booking.LedgerID,
+		IdentityID: booking.IdentityID,
+		AccountRef: booking.AccountRef,
+		Currency:   booking.Currency,
+	}, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	// The delivery is booked on the T+N future position (settle_code = offset),
+	// created on the fly with its settle date. The outflow hold may exceed the
+	// settled spot quantity; AllowOverdraft is safe because the tradable check
+	// above already validated the netted availability.
+	settleCode := params.settleOffset
+	deliverPosition, err := l.GetOrCreatePosition(ctx, model.PositionKey{
+		LedgerID:   booking.LedgerID,
+		IdentityID: booking.IdentityID,
+		AccountRef: booking.AccountRef,
+		Instrument: booking.Instrument,
+		Currency:   booking.Currency,
+		SettleCode: &settleCode,
+	}, &settleDate)
+	if err != nil {
+		return nil, err
+	}
+
+	price, err := decimal.NewFromString(booking.Price)
+	if err != nil {
+		return nil, fmt.Errorf("invalid price %q: %w", booking.Price, err)
+	}
+	money := price.Mul(decimal.NewFromFloat(booking.Quantity))
+
+	sharedMeta := func(leg string) map[string]interface{} {
+		return map[string]interface{}{
+			model.TradeMetaRef:        booking.Reference,
+			model.TradeMetaLeg:        leg,
+			model.TradeMetaSide:       model.TradeSideSell,
+			model.TradeMetaInstrument: booking.Instrument,
+			model.TradeMetaVenue:      params.venue,
+			model.TradeMetaQuantity:   booking.Quantity,
+			model.TradeMetaPrice:      booking.Price,
+			model.TradeMetaSettleDate: settleDate.Format(model.HolidayKeyFormat),
+		}
+	}
+
+	// Money leg: proceeds flow in from the broker settlement balance to the
+	// client money balance. The settlement balance funds the payout, so the
+	// outflow is allowed to overdraw it.
+	moneyTxn := &model.Transaction{
+		TransactionID:  model.GenerateUUIDWithSuffix("txn"),
+		Source:         booking.SettlementBalanceID,
+		Destination:    moneyBalance.BalanceID,
+		Amount:         money.InexactFloat64(),
+		AmountString:   money.String(),
+		Precision:      booking.MoneyPrecision,
+		Currency:       booking.Currency,
+		Reference:      booking.Reference + "_money",
+		Description:    fmt.Sprintf("Trade %s money leg: sell %v %s @ %s", booking.Reference, booking.Quantity, booking.Instrument, booking.Price),
+		Inflight:       true,
+		SkipQueue:      true,
+		AllowOverdraft: true,
+		MetaData:       sharedMeta(model.TradeMetaLegMoney),
+	}
+	recordedMoney, err := l.RecordTransaction(ctx, moneyTxn)
+	if err != nil {
+		return nil, fmt.Errorf("failed to book sell money leg: %w", err)
+	}
+
+	securityMeta := sharedMeta(model.TradeMetaLegSecurity)
+	securityMeta[model.TradeMetaMoneyLegID] = recordedMoney.TransactionID
+	securityTxn := &model.Transaction{
+		TransactionID:  model.GenerateUUIDWithSuffix("txn"),
+		Source:         deliverPosition.BalanceID,
+		Destination:    booking.MarketBalanceID,
+		Amount:         booking.Quantity,
+		AmountString:   decimal.NewFromFloat(booking.Quantity).String(),
+		Precision:      booking.QuantityPrecision,
+		Currency:       booking.Currency,
+		Reference:      booking.Reference + "_sec",
+		Description:    fmt.Sprintf("Trade %s security leg: deliver %v %s (T+%d)", booking.Reference, booking.Quantity, booking.Instrument, params.settleOffset),
+		Inflight:       true,
+		SkipQueue:      true,
+		AllowOverdraft: true, // covered by in-transit incoming, validated above
+		MetaData:       securityMeta,
+	}
+	recordedSecurity, err := l.RecordTransaction(ctx, securityTxn)
+	if err != nil {
+		if _, voidErr := l.VoidInflightTransaction(ctx, recordedMoney.TransactionID); voidErr != nil {
+			logrus.WithError(voidErr).WithField("transaction_id", recordedMoney.TransactionID).
+				Error("failed to void sell money leg after security leg failure")
+		}
+		return nil, fmt.Errorf("failed to book sell security leg: %w", err)
+	}
+
+	return &model.SellBookingResult{
+		TradeRef:          booking.Reference,
+		MoneyTxnID:        recordedMoney.TransactionID,
+		SecurityTxnID:     recordedSecurity.TransactionID,
+		MoneyBalanceID:    moneyBalance.BalanceID,
+		PositionBalanceID: deliverPosition.BalanceID,
+		SettleDate:        settleDate,
+		Tradable:          *tradable,
+	}, nil
 }
 
 // ApplyMutationPlan applies an atomic multi-position mutation plan
@@ -221,7 +462,11 @@ func (l *Blnk) BookTrade(ctx context.Context, booking model.TradeBooking) (*mode
 		tradeDate = time.Now()
 	}
 
-	settleDate, err := l.ComputeSettleDate(ctx, booking.Venue, tradeDate, booking.SettleOffset)
+	params, err := l.resolveTradeParams(ctx, booking.Instrument, booking.SettleOffset, booking.Venue)
+	if err != nil {
+		return nil, err
+	}
+	settleDate, err := l.ComputeSettleDate(ctx, params.venue, tradeDate, params.settleOffset)
 	if err != nil {
 		return nil, err
 	}
@@ -236,7 +481,7 @@ func (l *Blnk) BookTrade(ctx context.Context, booking model.TradeBooking) (*mode
 		return nil, err
 	}
 
-	settleCode := booking.SettleOffset
+	settleCode := params.settleOffset
 	futurePosition, err := l.GetOrCreatePosition(ctx, model.PositionKey{
 		LedgerID:   booking.LedgerID,
 		IdentityID: booking.IdentityID,
@@ -259,8 +504,9 @@ func (l *Blnk) BookTrade(ctx context.Context, booking model.TradeBooking) (*mode
 		return map[string]interface{}{
 			model.TradeMetaRef:        booking.Reference,
 			model.TradeMetaLeg:        leg,
+			model.TradeMetaSide:       model.TradeSideBuy,
 			model.TradeMetaInstrument: booking.Instrument,
-			model.TradeMetaVenue:      booking.Venue,
+			model.TradeMetaVenue:      params.venue,
 			model.TradeMetaQuantity:   booking.Quantity,
 			model.TradeMetaPrice:      booking.Price,
 			model.TradeMetaSettleDate: settleDate.Format(model.HolidayKeyFormat),
@@ -268,16 +514,18 @@ func (l *Blnk) BookTrade(ctx context.Context, booking model.TradeBooking) (*mode
 	}
 
 	moneyTxn := &model.Transaction{
-		Source:      moneyBalance.BalanceID,
-		Destination: booking.SettlementBalanceID,
-		Amount:      money.InexactFloat64(),
-		Precision:   booking.MoneyPrecision,
-		Currency:    booking.Currency,
-		Reference:   booking.Reference + "_money",
-		Description: fmt.Sprintf("Trade %s money leg: buy %v %s @ %s", booking.Reference, booking.Quantity, booking.Instrument, booking.Price),
-		Inflight:    true,
-		SkipQueue:   true,
-		MetaData:    sharedMeta(model.TradeMetaLegMoney),
+		TransactionID: model.GenerateUUIDWithSuffix("txn"),
+		Source:        moneyBalance.BalanceID,
+		Destination:   booking.SettlementBalanceID,
+		Amount:        money.InexactFloat64(),
+		AmountString:  money.String(),
+		Precision:     booking.MoneyPrecision,
+		Currency:      booking.Currency,
+		Reference:     booking.Reference + "_money",
+		Description:   fmt.Sprintf("Trade %s money leg: buy %v %s @ %s", booking.Reference, booking.Quantity, booking.Instrument, booking.Price),
+		Inflight:      true,
+		SkipQueue:     true,
+		MetaData:      sharedMeta(model.TradeMetaLegMoney),
 	}
 	recordedMoney, err := l.RecordTransaction(ctx, moneyTxn)
 	if err != nil {
@@ -287,13 +535,15 @@ func (l *Blnk) BookTrade(ctx context.Context, booking model.TradeBooking) (*mode
 	securityMeta := sharedMeta(model.TradeMetaLegSecurity)
 	securityMeta[model.TradeMetaMoneyLegID] = recordedMoney.TransactionID
 	securityTxn := &model.Transaction{
+		TransactionID:  model.GenerateUUIDWithSuffix("txn"),
 		Source:         booking.MarketBalanceID,
 		Destination:    futurePosition.BalanceID,
 		Amount:         booking.Quantity,
+		AmountString:   decimal.NewFromFloat(booking.Quantity).String(),
 		Precision:      booking.QuantityPrecision,
 		Currency:       booking.Currency,
 		Reference:      booking.Reference + "_sec",
-		Description:    fmt.Sprintf("Trade %s security leg: deliver %v %s (T+%d)", booking.Reference, booking.Quantity, booking.Instrument, booking.SettleOffset),
+		Description:    fmt.Sprintf("Trade %s security leg: deliver %v %s (T+%d)", booking.Reference, booking.Quantity, booking.Instrument, params.settleOffset),
 		Inflight:       true,
 		SkipQueue:      true,
 		AllowOverdraft: true, // the market counterparty balance may go short
@@ -330,10 +580,11 @@ func metaString(meta map[string]interface{}, key string) string {
 	return ""
 }
 
-// SettleTrade settles one booked trade by its security leg transaction ID:
-// commits the money hold, commits the security delivery into the T+N future
-// position, rolls the position to spot with a plain double-entry transaction
-// and refreshes the weighted-average price plus the purchase lot
+// SettleTrade settles the future balance bucket that holds a given trade's
+// security leg. All trades sharing that settle date/instrument/account settle
+// together: their money and security holds are committed, buys refresh the
+// weighted-average price and record a lot, and the net delivered/received
+// quantity is rolled to the spot position with a plain double-entry transaction
 // (TradeControl trade settlement + recalculateWawPrice + BalanceDetail).
 func (l *Blnk) SettleTrade(ctx context.Context, securityTxnID string) (*model.TradeSettlementResult, error) {
 	securityTxn, err := l.datasource.GetTransaction(ctx, securityTxnID)
@@ -343,34 +594,38 @@ func (l *Blnk) SettleTrade(ctx context.Context, securityTxnID string) (*model.Tr
 	if metaString(securityTxn.MetaData, model.TradeMetaLeg) != model.TradeMetaLegSecurity {
 		return nil, fmt.Errorf("transaction %s is not a trade security leg", securityTxnID)
 	}
-
-	tradeRef := metaString(securityTxn.MetaData, model.TradeMetaRef)
-	result := &model.TradeSettlementResult{
-		TradeRef:        tradeRef,
-		SecurityTxnID:   securityTxnID,
-		FutureBalanceID: securityTxn.Destination,
+	// The future balance is the destination for buys and the source for sells.
+	futureBalanceID := securityTxn.Destination
+	if metaString(securityTxn.MetaData, model.TradeMetaSide) == model.TradeSideSell {
+		futureBalanceID = securityTxn.Source
 	}
 
-	// 1. Commit the money hold (full remaining amount).
-	if moneyLegID := metaString(securityTxn.MetaData, model.TradeMetaMoneyLegID); moneyLegID != "" {
-		if _, err := l.CommitInflightTransaction(ctx, moneyLegID, big.NewInt(0)); err != nil {
-			return nil, fmt.Errorf("failed to commit money leg %s: %w", moneyLegID, err)
+	settled, err := l.settleFutureBalance(ctx, futureBalanceID)
+	if err != nil {
+		return nil, err
+	}
+	for i := range settled {
+		if settled[i].SecurityTxnID == securityTxnID {
+			return &settled[i], nil
 		}
-		result.MoneyTxnID = moneyLegID
 	}
+	// The bucket settled but did not contain a residual to report for this leg.
+	return &model.TradeSettlementResult{TradeRef: metaString(securityTxn.MetaData, model.TradeMetaRef), SecurityTxnID: securityTxnID, FutureBalanceID: futureBalanceID}, nil
+}
 
-	// 2. Commit the security delivery into the future position.
-	if _, err := l.CommitInflightTransaction(ctx, securityTxnID, big.NewInt(0)); err != nil {
-		return nil, fmt.Errorf("failed to commit security leg %s: %w", securityTxnID, err)
-	}
-
-	// 3. Resolve the future position and its spot counterpart.
-	future, err := l.datasource.GetPositionByID(ctx, securityTxn.Destination)
+// settleFutureBalance settles every pending trade leg on a future balance,
+// then nets the resulting position to spot in a single roll. Buys are
+// committed before sells so the weighted-average blend sees the pre-sale
+// quantity, and the net roll direction follows the sign of the settled
+// quantity (incoming -> future->spot, outgoing -> spot->future), leaving the
+// future balance at zero.
+func (l *Blnk) settleFutureBalance(ctx context.Context, futureBalanceID string) ([]model.TradeSettlementResult, error) {
+	future, err := l.datasource.GetPositionByID(ctx, futureBalanceID)
 	if err != nil {
 		return nil, err
 	}
 	if future.AccountRef == "" || future.Instrument == "" {
-		return nil, fmt.Errorf("balance %s is not a brokerage security position", future.BalanceID)
+		return nil, fmt.Errorf("balance %s is not a brokerage security position", futureBalanceID)
 	}
 	spot, err := l.GetOrCreatePosition(ctx, model.PositionKey{
 		LedgerID:   future.LedgerID,
@@ -382,80 +637,165 @@ func (l *Blnk) SettleTrade(ctx context.Context, securityTxnID string) (*model.Tr
 	if err != nil {
 		return nil, err
 	}
-	result.SpotBalanceID = spot.BalanceID
 
-	// 4. Roll the delivered quantity from the future balance to spot —
-	//    plain double-entry, exact via the precise amount.
-	quantity := securityTxn.PreciseAmount
-	rollTxn := &model.Transaction{
-		Source:        future.BalanceID,
-		Destination:   spot.BalanceID,
-		PreciseAmount: quantity,
-		Precision:     securityTxn.Precision,
-		Currency:      securityTxn.Currency,
-		Reference:     securityTxn.Reference + "_roll",
-		Description:   fmt.Sprintf("Trade %s settlement roll T+N -> spot", tradeRef),
-		SkipQueue:     true,
-		MetaData: map[string]interface{}{
-			model.TradeMetaRef: tradeRef,
-			model.TradeMetaLeg: "roll",
-		},
-	}
-	recordedRoll, err := l.RecordTransaction(ctx, rollTxn)
+	legs, err := l.datasource.GetPendingInflightByBalance(ctx, futureBalanceID)
 	if err != nil {
-		return nil, fmt.Errorf("failed to roll position to spot: %w", err)
+		return nil, err
 	}
-	result.RollTxnID = recordedRoll.TransactionID
-
-	// 5. Refresh the weighted-average price and record the purchase lot.
-	//    spot still holds the pre-roll quantity snapshot, which is exactly
-	//    qty_old in the TradeControl formula.
-	priceStr := metaString(securityTxn.MetaData, model.TradeMetaPrice)
-	if priceStr != "" && securityTxn.Precision >= 1 {
-		price, perr := decimal.NewFromString(priceStr)
-		if perr != nil {
-			logrus.WithError(perr).WithField("trade_ref", tradeRef).Warn("invalid trade price in metadata, skipping wa price update")
-			return result, nil
+	// Keep only security legs and order buys (incoming) before sells (outgoing).
+	var buys, sells []*model.Transaction
+	for _, leg := range legs {
+		if metaString(leg.MetaData, model.TradeMetaLeg) != model.TradeMetaLegSecurity {
+			continue
 		}
-		qtyPrecision := decimal.NewFromFloat(securityTxn.Precision)
-		currentQty := decimal.NewFromBigInt(spot.Balance, 0).Div(qtyPrecision)
-		tradeQty := decimal.NewFromBigInt(quantity, 0).Div(qtyPrecision)
-		tradeMoney := tradeQty.Mul(price)
-
-		newWA, werr := model.RecalculateWAPrice(spot.WAPrice, currentQty, tradeQty, tradeMoney)
-		if werr != nil {
-			return nil, fmt.Errorf("failed to recalculate wa price: %w", werr)
+		if metaString(leg.MetaData, model.TradeMetaSide) == model.TradeSideSell {
+			sells = append(sells, leg)
+		} else {
+			buys = append(buys, leg)
 		}
-		if err := l.datasource.UpdateWAPrice(ctx, spot.BalanceID, newWA.StringFixed(2)); err != nil {
+	}
+
+	var results []model.TradeSettlementResult
+	// addedQty tracks buy quantity committed in this run so the WA blend of a
+	// second buy accounts for earlier buys not yet rolled into spot.
+	addedQty := decimal.Zero
+	for _, leg := range buys {
+		res, qty, err := l.settleSecurityLeg(ctx, leg, spot, future, addedQty)
+		if err != nil {
 			return nil, err
 		}
-		result.WAPrice = newWA.StringFixed(2)
-
-		lot, lerr := l.datasource.CreateLot(ctx, model.BalanceLot{
-			BalanceID:   spot.BalanceID,
-			Instrument:  future.Instrument,
-			Quantity:    quantity,
-			Precision:   int64(securityTxn.Precision),
-			Price:       price.String(),
-			Currency:    securityTxn.Currency,
-			Reference:   tradeRef,
-			PurchasedAt: time.Now(),
-		})
-		if lerr != nil {
-			return nil, lerr
+		addedQty = addedQty.Add(qty)
+		results = append(results, *res)
+	}
+	for _, leg := range sells {
+		res, _, err := l.settleSecurityLeg(ctx, leg, spot, future, addedQty)
+		if err != nil {
+			return nil, err
 		}
-		result.LotID = lot.LotID
+		results = append(results, *res)
 	}
 
-	return result, nil
+	// Net roll: move the future balance's settled quantity to spot and zero it.
+	if err := l.netRollToSpot(ctx, futureBalanceID, spot.BalanceID); err != nil {
+		return nil, err
+	}
+	return results, nil
+}
+
+// settleSecurityLeg commits one trade's money and security holds. For a buy it
+// refreshes the weighted-average price and records a lot, returning the bought
+// quantity as a decimal; for a sell it only commits (selling at WA leaves the
+// remaining WA unchanged).
+func (l *Blnk) settleSecurityLeg(ctx context.Context, securityTxn *model.Transaction, spot, future *model.Balance, addedQty decimal.Decimal) (*model.TradeSettlementResult, decimal.Decimal, error) {
+	tradeRef := metaString(securityTxn.MetaData, model.TradeMetaRef)
+	isSell := metaString(securityTxn.MetaData, model.TradeMetaSide) == model.TradeSideSell
+	result := &model.TradeSettlementResult{
+		TradeRef:        tradeRef,
+		SecurityTxnID:   securityTxn.TransactionID,
+		FutureBalanceID: future.BalanceID,
+		SpotBalanceID:   spot.BalanceID,
+	}
+
+	if moneyLegID := metaString(securityTxn.MetaData, model.TradeMetaMoneyLegID); moneyLegID != "" {
+		if _, err := l.CommitInflightTransaction(ctx, moneyLegID, big.NewInt(0)); err != nil {
+			return nil, decimal.Zero, fmt.Errorf("failed to commit money leg %s: %w", moneyLegID, err)
+		}
+		result.MoneyTxnID = moneyLegID
+	}
+	if _, err := l.CommitInflightTransaction(ctx, securityTxn.TransactionID, big.NewInt(0)); err != nil {
+		return nil, decimal.Zero, fmt.Errorf("failed to commit security leg %s: %w", securityTxn.TransactionID, err)
+	}
+
+	if isSell || securityTxn.Precision < 1 {
+		return result, decimal.Zero, nil
+	}
+
+	priceStr := metaString(securityTxn.MetaData, model.TradeMetaPrice)
+	if priceStr == "" {
+		return result, decimal.Zero, nil
+	}
+	price, err := decimal.NewFromString(priceStr)
+	if err != nil {
+		logrus.WithError(err).WithField("trade_ref", tradeRef).Warn("invalid trade price in metadata, skipping wa price update")
+		return result, decimal.Zero, nil
+	}
+
+	qtyPrecision := decimal.NewFromFloat(securityTxn.Precision)
+	tradeQty := decimal.NewFromBigInt(securityTxn.PreciseAmount, 0).Div(qtyPrecision)
+	// currentQty = settled spot quantity plus buys already committed this run.
+	currentQty := decimal.NewFromBigInt(spot.Balance, 0).Div(qtyPrecision).Add(addedQty)
+	tradeMoney := tradeQty.Mul(price)
+
+	newWA, err := model.RecalculateWAPrice(spot.WAPrice, currentQty, tradeQty, tradeMoney)
+	if err != nil {
+		return nil, decimal.Zero, fmt.Errorf("failed to recalculate wa price: %w", err)
+	}
+	if err := l.datasource.UpdateWAPrice(ctx, spot.BalanceID, newWA.StringFixed(2)); err != nil {
+		return nil, decimal.Zero, err
+	}
+	spot.WAPrice = newWA.StringFixed(2) // keep the in-memory snapshot consistent for the next buy
+	result.WAPrice = newWA.StringFixed(2)
+
+	lot, err := l.datasource.CreateLot(ctx, model.BalanceLot{
+		BalanceID:   spot.BalanceID,
+		Instrument:  future.Instrument,
+		Quantity:    new(big.Int).Set(securityTxn.PreciseAmount),
+		Precision:   int64(securityTxn.Precision),
+		Price:       price.String(),
+		Currency:    securityTxn.Currency,
+		Reference:   tradeRef,
+		PurchasedAt: time.Now(),
+	})
+	if err != nil {
+		return nil, decimal.Zero, err
+	}
+	result.LotID = lot.LotID
+	return result, tradeQty, nil
+}
+
+// netRollToSpot moves the settled quantity left on a future balance to its spot
+// counterpart and zeroes the future balance. A positive net (incoming) rolls
+// future->spot, a negative net (outgoing) rolls spot->future; overdraft is
+// allowed because the net economics were validated at booking time.
+func (l *Blnk) netRollToSpot(ctx context.Context, futureBalanceID, spotBalanceID string) error {
+	future, err := l.datasource.GetPositionByID(ctx, futureBalanceID)
+	if err != nil {
+		return err
+	}
+	future.InitializeBalanceFields()
+	net := future.Balance
+	if net.Sign() == 0 {
+		return nil
+	}
+
+	source, destination := futureBalanceID, spotBalanceID
+	amount := new(big.Int).Set(net)
+	if net.Sign() < 0 {
+		source, destination = spotBalanceID, futureBalanceID
+		amount = new(big.Int).Neg(net)
+	}
+
+	_, err = l.RecordTransaction(ctx, &model.Transaction{
+		TransactionID:  model.GenerateUUIDWithSuffix("txn"),
+		Source:         source,
+		Destination:    destination,
+		PreciseAmount:  amount,
+		Precision:      1,
+		Currency:       future.Currency,
+		Reference:      model.GenerateUUIDWithSuffix("roll"),
+		Description:    "Settlement net roll T+N <-> spot",
+		SkipQueue:      true,
+		AllowOverdraft: true,
+		MetaData:       map[string]interface{}{model.TradeMetaLeg: "roll"},
+	})
+	return err
 }
 
 // RunSettlement settles everything that matured by asOf
 // (TradeControl settlement pass): finds future balances whose settle date has
-// been reached, settles their pending trade legs and rolls any residual
-// settled quantity to spot (crash recovery for interrupted settlements).
-// Failures are aggregated per artifact, mirroring the TradeControl error
-// aggregation, so one broken trade does not block the run.
+// been reached and settles each bucket (commit holds, refresh WA, net roll to
+// spot). Failures are aggregated per balance, mirroring the TradeControl error
+// aggregation, so one broken bucket does not block the run.
 func (l *Blnk) RunSettlement(ctx context.Context, asOf time.Time, limit int) (*model.SettlementRunResult, error) {
 	if limit <= 0 {
 		limit = defaultSettlementBatch
@@ -468,63 +808,12 @@ func (l *Blnk) RunSettlement(ctx context.Context, asOf time.Time, limit int) (*m
 	result := &model.SettlementRunResult{AsOf: asOf, Errors: make(map[string]string)}
 	for _, position := range matured {
 		result.Examined++
-
-		pending, err := l.datasource.GetPendingInflightByDestination(ctx, position.BalanceID)
+		settled, err := l.settleFutureBalance(ctx, position.BalanceID)
 		if err != nil {
 			result.Errors[position.BalanceID] = err.Error()
 			continue
 		}
-		for _, txn := range pending {
-			if metaString(txn.MetaData, model.TradeMetaLeg) != model.TradeMetaLegSecurity {
-				continue
-			}
-			settled, err := l.SettleTrade(ctx, txn.TransactionID)
-			if err != nil {
-				result.Errors[txn.TransactionID] = err.Error()
-				continue
-			}
-			result.Settled = append(result.Settled, *settled)
-		}
-
-		// Crash recovery: a settled-but-unrolled remainder is rolled to spot.
-		if err := l.rollResidualToSpot(ctx, position.BalanceID); err != nil {
-			result.Errors[position.BalanceID] = err.Error()
-		}
+		result.Settled = append(result.Settled, settled...)
 	}
 	return result, nil
-}
-
-// rollResidualToSpot moves any settled quantity left on a matured future
-// balance to its spot counterpart.
-func (l *Blnk) rollResidualToSpot(ctx context.Context, futureBalanceID string) error {
-	future, err := l.datasource.GetPositionByID(ctx, futureBalanceID)
-	if err != nil {
-		return err
-	}
-	if future.Balance.Sign() <= 0 || future.AccountRef == "" {
-		return nil
-	}
-	spot, err := l.GetOrCreatePosition(ctx, model.PositionKey{
-		LedgerID:   future.LedgerID,
-		IdentityID: future.IdentityID,
-		AccountRef: future.AccountRef,
-		Instrument: future.Instrument,
-		Currency:   future.Currency,
-	}, nil)
-	if err != nil {
-		return err
-	}
-
-	_, err = l.RecordTransaction(ctx, &model.Transaction{
-		Source:        future.BalanceID,
-		Destination:   spot.BalanceID,
-		PreciseAmount: new(big.Int).Set(future.Balance),
-		Precision:     1,
-		Currency:      future.Currency,
-		Reference:     model.GenerateUUIDWithSuffix("roll"),
-		Description:   "Residual settlement roll T+N -> spot",
-		SkipQueue:     true,
-		MetaData:      map[string]interface{}{model.TradeMetaLeg: "roll"},
-	})
-	return err
 }

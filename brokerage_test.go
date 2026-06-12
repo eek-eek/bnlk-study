@@ -25,6 +25,7 @@ import (
 	"github.com/alicebob/miniredis/v2"
 	"github.com/blnkfinance/blnk/config"
 	"github.com/blnkfinance/blnk/database/mocks"
+	"github.com/blnkfinance/blnk/internal/apierror"
 	"github.com/blnkfinance/blnk/model"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
@@ -191,6 +192,112 @@ func TestComputeSettleDate_UsesVenueHolidays(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Equal(t, "2026-06-17", settleDate.Format(model.HolidayKeyFormat))
 	datasource.AssertExpectations(t)
+}
+
+// --- Scenario: 100 AAPL settled, buy 50 T+2, sell 125 today ---
+//
+// These tests verify the heart of the requirement: the sell availability is
+// computed with settle-date arithmetic, and the in-transit 50 are counted only
+// when the instrument is flagged as trading on the way.
+
+func TestGetTradablePosition_OnTheWayCountsIncoming(t *testing.T) {
+	service, datasource, cleanup := newBrokerageTestBlnk(t)
+	defer cleanup()
+
+	// AAPL trades T+2 on the way.
+	datasource.On("GetInstrumentSettings", mock.Anything, "AAPL").
+		Return(&model.InstrumentSettings{Instrument: "AAPL", TradesOnTheWay: true, SettleOffset: 2}, nil)
+	// Settled spot position: 100, nothing blocked.
+	datasource.On("GetPosition", mock.Anything, mock.MatchedBy(func(k model.PositionKey) bool {
+		return k.Instrument == "AAPL" && k.SettleCode == nil
+	})).Return(&model.Balance{
+		BalanceID: "bln_spot", Balance: big.NewInt(100), InflightDebitBalance: big.NewInt(0),
+	}, nil)
+	// In transit by the sell settle date: +50 incoming (the buy), nothing outgoing.
+	datasource.On("SumFutureHolds", mock.Anything, "ldg", "idn", "acc", "AAPL", "USD", mock.Anything).
+		Return(big.NewInt(50), big.NewInt(0), nil)
+
+	asOf := time.Date(2026, 6, 16, 0, 0, 0, 0, time.UTC)
+	tradable, err := service.GetTradablePosition(context.Background(), "ldg", "idn", "acc", "AAPL", "USD", asOf)
+	assert.NoError(t, err)
+	assert.True(t, tradable.OnTheWay)
+	// 100 settled - 0 blocked + 50 incoming - 0 outgoing = 150.
+	assert.Equal(t, int64(150), tradable.Tradable.Int64())
+}
+
+func TestGetTradablePosition_ImmediateIgnoresIncoming(t *testing.T) {
+	service, datasource, cleanup := newBrokerageTestBlnk(t)
+	defer cleanup()
+
+	// MSFT has no on-the-way flag.
+	datasource.On("GetInstrumentSettings", mock.Anything, "MSFT").
+		Return((*model.InstrumentSettings)(nil), apierror.NewAPIError(apierror.ErrNotFound, "none", nil))
+	datasource.On("GetPosition", mock.Anything, mock.Anything).Return(&model.Balance{
+		BalanceID: "bln_spot", Balance: big.NewInt(100), InflightDebitBalance: big.NewInt(0),
+	}, nil)
+	// SumFutureHolds must NOT be consulted for an immediate-settlement instrument.
+
+	asOf := time.Date(2026, 6, 16, 0, 0, 0, 0, time.UTC)
+	tradable, err := service.GetTradablePosition(context.Background(), "ldg", "idn", "acc", "MSFT", "USD", asOf)
+	assert.NoError(t, err)
+	assert.False(t, tradable.OnTheWay)
+	// Only the settled 100 is tradable; the future 50 is ignored.
+	assert.Equal(t, int64(100), tradable.Tradable.Int64())
+	datasource.AssertNotCalled(t, "SumFutureHolds", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything)
+}
+
+func TestSellTrade_RejectsWhenImmediateInstrumentLacksSettled(t *testing.T) {
+	service, datasource, cleanup := newBrokerageTestBlnk(t)
+	defer cleanup()
+
+	// Immediate-settlement instrument: only the settled 100 can be sold, so 125 must be rejected.
+	datasource.On("GetInstrumentSettings", mock.Anything, "MSFT").
+		Return((*model.InstrumentSettings)(nil), apierror.NewAPIError(apierror.ErrNotFound, "none", nil))
+	datasource.On("GetPosition", mock.Anything, mock.Anything).Return(&model.Balance{
+		BalanceID: "bln_spot", Balance: big.NewInt(100), InflightDebitBalance: big.NewInt(0),
+	}, nil)
+
+	_, err := service.SellTrade(context.Background(), model.SellBooking{
+		LedgerID: "ldg", IdentityID: "idn", AccountRef: "acc",
+		Instrument: "MSFT", Venue: "", Currency: "USD",
+		Quantity: 125, QuantityPrecision: 1, Price: "200.00", MoneyPrecision: 100,
+		SettleOffset: 2, SettlementBalanceID: "bln_settle", MarketBalanceID: "bln_market",
+		Reference: "sell_001",
+	})
+	assert.Error(t, err)
+	apiErr, ok := err.(apierror.APIError)
+	assert.True(t, ok)
+	assert.Equal(t, apierror.ErrBadRequest, apiErr.Code)
+	assert.Contains(t, err.Error(), "insufficient tradable")
+	// Rejected before any booking.
+	datasource.AssertNotCalled(t, "RecordTransaction", mock.Anything, mock.Anything)
+}
+
+func TestSellTrade_RejectsWhenExceedingTradableOnTheWay(t *testing.T) {
+	service, datasource, cleanup := newBrokerageTestBlnk(t)
+	defer cleanup()
+
+	// On-the-way: tradable = 100 + 50 = 150; selling 200 must be rejected.
+	datasource.On("GetInstrumentSettings", mock.Anything, "AAPL").
+		Return(&model.InstrumentSettings{Instrument: "AAPL", TradesOnTheWay: true, SettleOffset: 2}, nil)
+	datasource.On("GetHolidays", mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+		Return([]model.MarketHoliday{}, nil)
+	datasource.On("GetPosition", mock.Anything, mock.Anything).Return(&model.Balance{
+		BalanceID: "bln_spot", Balance: big.NewInt(100), InflightDebitBalance: big.NewInt(0),
+	}, nil)
+	datasource.On("SumFutureHolds", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+		Return(big.NewInt(50), big.NewInt(0), nil)
+
+	_, err := service.SellTrade(context.Background(), model.SellBooking{
+		LedgerID: "ldg", IdentityID: "idn", AccountRef: "acc",
+		Instrument: "AAPL", Venue: "KASE", Currency: "USD",
+		Quantity: 200, QuantityPrecision: 1, Price: "190.00", MoneyPrecision: 100,
+		SettleOffset: 2, SettlementBalanceID: "bln_settle", MarketBalanceID: "bln_market",
+		Reference: "sell_002",
+	})
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "insufficient tradable")
+	datasource.AssertNotCalled(t, "RecordTransaction", mock.Anything, mock.Anything)
 }
 
 func TestComputeSettleDate_EmptyVenueSkipsCalendarLookup(t *testing.T) {

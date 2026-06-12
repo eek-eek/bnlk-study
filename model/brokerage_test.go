@@ -246,6 +246,45 @@ func TestBalanceDeltaIsNoOp(t *testing.T) {
 	assert.False(t, BalanceDelta{Key: key, WaitingDelta: big.NewInt(1)}.IsNoOp())
 }
 
+func TestComputeTradable_Scenario(t *testing.T) {
+	// 100 AAPL settled, buy 50 (T+2) in transit, no prior outgoing.
+	settled := big.NewInt(100)
+	blocked := big.NewInt(0)
+	incoming := big.NewInt(50)
+	outgoing := big.NewInt(0)
+
+	t.Run("on-the-way instrument counts the in-transit 50", func(t *testing.T) {
+		// 100 - 0 + 50 - 0 = 150, so selling 125 today (settles T+2) is allowed.
+		tradable := ComputeTradable(settled, blocked, incoming, outgoing, true)
+		assert.Equal(t, int64(150), tradable.Int64())
+		assert.True(t, tradable.Cmp(big.NewInt(125)) >= 0)
+	})
+
+	t.Run("immediate-settlement instrument ignores the in-transit 50", func(t *testing.T) {
+		// Only the settled 100 is tradable, so selling 125 must be rejected.
+		tradable := ComputeTradable(settled, blocked, incoming, outgoing, false)
+		assert.Equal(t, int64(100), tradable.Int64())
+		assert.True(t, tradable.Cmp(big.NewInt(125)) < 0)
+	})
+
+	t.Run("a second sell sees the first sell as outgoing", func(t *testing.T) {
+		// After selling 125, outgoing = 125: tradable = 100 + 50 - 125 = 25.
+		tradable := ComputeTradable(settled, blocked, incoming, big.NewInt(125), true)
+		assert.Equal(t, int64(25), tradable.Int64())
+	})
+
+	t.Run("negative result is clamped to zero", func(t *testing.T) {
+		tradable := ComputeTradable(big.NewInt(10), big.NewInt(0), big.NewInt(0), big.NewInt(50), true)
+		assert.Equal(t, int64(0), tradable.Int64())
+	})
+
+	t.Run("blocked reduces tradable", func(t *testing.T) {
+		// 100 settled, 30 already blocked, no transit: 70 tradable.
+		tradable := ComputeTradable(big.NewInt(100), big.NewInt(30), nil, nil, false)
+		assert.Equal(t, int64(70), tradable.Int64())
+	})
+}
+
 func TestTradeBookingValidate(t *testing.T) {
 	valid := TradeBooking{
 		LedgerID: "ldg", IdentityID: "idn", AccountRef: "acc",

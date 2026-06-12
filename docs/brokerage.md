@@ -37,6 +37,43 @@
 
 ---
 
+## 1a. Продажа в пути и признак инструмента «trades on the way»
+
+Доступное к продаже количество считается с учётом дат расчётов, но **только
+для инструментов с признаком торговли в пути** (`instrument_settings.trades_on_the_way`):
+
+```
+on-the-way:  tradable = settled - blocked + incoming(≤ settle_date) - outgoing(≤ settle_date)
+immediate:   tradable = settled - blocked            # будущие приход/расход НЕ учитываются
+```
+
+- `settled` — спот-остаток; `blocked` — inflight-дебет на споте;
+- `incoming`/`outgoing` — суммарный inflight-кредит/дебет на future-балансах,
+  созревающих не позже даты расчёта продажи (`SumFutureHolds`).
+
+Если на инструменте нет настроек или флаг выключен — это
+immediate-settlement: продать можно только расчётный остаток, приход/расход
+в пути игнорируются (`ComputeTradable(..., onTheWay=false)`).
+
+`SellTrade` сначала проверяет `GetTradablePosition` на дату расчёта продажи и
+отклоняет сделку при нехватке, затем книжит леги: бумаги — inflight-дебет с
+future-позиции на market (`AllowOverdraft`, т.к. покрыто приходом в пути),
+деньги — inflight-кредит от settlement.
+
+**Пример (реальный e2e-тест `TestBrokerageChain_...`):** было 100 AAPL,
+куплено 50 (T+2), сегодня продаётся 125. AAPL — on-the-way ⇒ tradable =
+100 + 50 = 150, продажа 125 проходит; последующие 26 отклоняются (осталось 25).
+После расчётов (`RunSettlement`): спот = 100 + 50 − 125 = **25 @ WA 160.00**
+(блендинг 100@150 + 50@180 по 150 бумагам). Для immediate-инструмента та же
+продажа 125 была бы отклонена (доступно только 100).
+
+### Известное ограничение
+Future-балансы идентифицируются по `settle_code` (смещению T+N), а не по
+абсолютной `settle_date`. Сделки одного инструмента/счёта с одинаковым T+N в
+разные торговые дни попадают в один bucket. Для сценария «в пределах одного
+дня» (как выше) это корректно; для мультидневного разделения нужен переход на
+ключ по `settle_date` — следующий шаг.
+
 ## 2. Семантика settle T+N
 
 - `settle_code = NULL` — текущий (spot) баланс; `settle_code = N` — будущий
@@ -139,8 +176,12 @@ errorMessage, currency)`.
 | POST | `/brokerage/settle-date` | расчёт settle-даты T+N с учётом праздников |
 | POST | `/brokerage/positions` | find-or-create позиционного баланса по ключу |
 | GET | `/brokerage/positions/active` | каскадный поиск активного баланса (T+N→…→spot) |
-| POST | `/brokerage/trades` | букинг сделки (hold денег + future-позиция) |
-| POST | `/brokerage/trades/:txID/settle` | расчёт одной сделки по security-легу |
+| POST | `/brokerage/instruments` | задать режим инструмента (trades_on_the_way, T+N) |
+| GET | `/brokerage/instruments/:instrument` | режим инструмента |
+| GET | `/brokerage/positions/tradable` | доступно к продаже (settle-aware, по флагу) |
+| POST | `/brokerage/trades` | букинг покупки (hold денег + future-позиция) |
+| POST | `/brokerage/sell-trades` | букинг продажи (hold бумаг + приход денег) |
+| POST | `/brokerage/trades/:txID/settle` | расчёт bucket'а по security-легу |
 | POST | `/brokerage/settlements/run` | ролл созревших future-балансов + коммит холдов |
 | POST | `/brokerage/mutations` | применить MutationPlan |
 | POST | `/brokerage/balances/recalculate-holds` | пересчёт blocked/waiting из истории |

@@ -104,6 +104,17 @@ Blnk — это ledger двойной записи: у каждого балан
 **Правило:** нет записи или `trades_on_the_way = false` ⇒ инструмент
 immediate-settlement: будущие приход/расход **не** учитываются как доступные.
 
+### 2.5. `blnk.brokerage_settlement_journal` — журнал расчёта
+
+Идемпотентность и восстановление побочных эффектов расчёта (см. §5.4).
+Ключ — `security_txn_id`. Поля `wa_before`, `qty_before`, `price`, `quantity`,
+`precision` захватывают вход для детерминированного пересчёта `wa_after`;
+`status` ∈ {`pending`, `applied`}; `lot_id` — созданный лот.
+
+> **Входные значения брокерского API — строки/целые, не float.** `quantity`
+> передаётся точной decimal-строкой, `*_precision` — целыми; перевод в minor
+> units идёт через `model.PreciseQuantity`/`PreciseMoney` → `big.Int`.
+
 ---
 
 ## 3. Слои и сервисы (где какой код)
@@ -124,6 +135,7 @@ immediate-settlement: будущие приход/расход **не** учит
 - `GetTradablePosition` — **сколько можно продать** (settle-aware).
 - `BookTrade` (покупка) / `SellTrade` (продажа) — букинг.
 - `SettleTrade` / `RunSettlement` — расчёты (settlement).
+- `ReconcileSettlement` — восстановление незавершённых побочных эффектов расчёта.
 - `ApplyMutationPlan` — атомарная корректировка набора позиций.
 - `RecalculateHolds` — пересборка блокировок/прихода из транзакций.
 - `GetFreeBalance` — свободный остаток по денежному балансу.
@@ -276,6 +288,29 @@ Blnk (см. ниже).
 рассчитывает весь bucket этой даты.
 
 Ошибки агрегируются по позициям/сделкам — один сбой не блокирует проход.
+
+### 5.4. Надёжность расчёта (двухфазный журнал + recovery)
+
+Побочные эффекты расчёта покупки (`wa_price` + лот) применяются **атомарно и
+восстановимо** через `brokerage_settlement_journal`:
+
+1. до коммита легов пишется `pending`-строка с `wa_before`/`qty_before`
+   (этого достаточно, чтобы `wa_after` пересчитывался детерминированно);
+2. лот + `wa_price` + флаг `applied` — в одной транзакции БД;
+3. при сбое между коммитом и шагом 2 остаётся `pending`-строка, которую
+   `ReconcileSettlement` (вызывается в начале `RunSettlement`) доводит до конца.
+
+Лоты идемпотентны по `(balance_id, reference)`; `GetMaturedPositions`
+пропускает обнулённые bucket'ы, поэтому повторный `RunSettlement` идемпотентен.
+
+### 5.5. Наблюдаемость (метрики)
+
+`internal/metrics/brokerage.go` экспортирует OTel-инструменты:
+`blnk.brokerage.trade.booked.total` (side, instrument),
+`blnk.brokerage.sell.rejected.total` (reason),
+`blnk.brokerage.settlement.run.total`, `…errors.total`, `…settled.trades.total`,
+`…matured_buckets` (гистограмма), `…settlement.duration` (гистограмма),
+`…settlement.reconciled.total`.
 
 ---
 

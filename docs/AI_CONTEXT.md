@@ -48,6 +48,10 @@
 | `sql/1781243214.sql` | миграция | колонки `account_ref/instrument/settle_date/settle_code/wa_price`, таблицы `balance_lots`, `market_holidays` |
 | `sql/1781246704.sql` | миграция | таблица `instrument_settings` |
 | `sql/1781256443.sql` | миграция | перевыпуск уникального индекса ключа позиции на `settle_date` |
+| `sql/1781270635.sql` | миграция | индекс `idx_balances_settle_date` по `settle_date` (а не `settle_code`) |
+| `sql/1781270771.sql` | миграция | таблица `brokerage_settlement_journal` (двухфазный recovery расчёта) |
+| `sql/1781270772.sql` | миграция | идемпотентные лоты (unique `balance_lots(balance_id, reference)`) |
+| `internal/metrics/brokerage.go` | метрики | brokerage-инструменты (booked/rejected/settlement/reconciled/latency) |
 
 Модель данных и слои наглядно — в диаграммах `docs/brokerage_reference.md` §11.
 
@@ -78,6 +82,17 @@
 9. **Штатные движения** денег/бумаг идут через **транзакции Blnk**
    (`RecordTransaction`/inflight), а не через `ApplyMutationPlan` (последний —
    только для ручных корректировок под распределённой блокировкой).
+10. **Расчёт идемпотентен и восстановим.** Побочные эффекты расчёта покупки
+    (`wa_price` + лот) пишутся атомарно через двухфазный
+    `brokerage_settlement_journal`: pending-строка (с `wa_before`/`qty_before`)
+    до коммита легов, `applied` — в одной транзакции с лотом и ценой.
+    `RunSettlement` сначала вызывает `ReconcileSettlement` (доводит pending),
+    `GetMaturedPositions` пропускает обнулённые bucket'ы. Лоты идемпотентны по
+    `(balance_id, reference)`.
+11. **Числа на входе — строки/int, не float.** Брокерское API принимает
+    `quantity` строкой (decimal) и `*_precision` целыми; value-путь идёт через
+    `model.PreciseQuantity`/`PreciseMoney` → `big.Int`. Float64 в денежных/
+    количественных значениях не используется.
 
 ---
 

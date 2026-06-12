@@ -260,7 +260,7 @@ func TestSellTrade_RejectsWhenImmediateInstrumentLacksSettled(t *testing.T) {
 	_, err := service.SellTrade(context.Background(), model.SellBooking{
 		LedgerID: "ldg", IdentityID: "idn", AccountRef: "acc",
 		Instrument: "MSFT", Venue: "", Currency: "USD",
-		Quantity: 125, QuantityPrecision: 1, Price: "200.00", MoneyPrecision: 100,
+		Quantity: "125", QuantityPrecision: 1, Price: "200.00", MoneyPrecision: 100,
 		SettleOffset: 2, SettlementBalanceID: "bln_settle", MarketBalanceID: "bln_market",
 		Reference: "sell_001",
 	})
@@ -291,7 +291,7 @@ func TestSellTrade_RejectsWhenExceedingTradableOnTheWay(t *testing.T) {
 	_, err := service.SellTrade(context.Background(), model.SellBooking{
 		LedgerID: "ldg", IdentityID: "idn", AccountRef: "acc",
 		Instrument: "AAPL", Venue: "KASE", Currency: "USD",
-		Quantity: 200, QuantityPrecision: 1, Price: "190.00", MoneyPrecision: 100,
+		Quantity: "200", QuantityPrecision: 1, Price: "190.00", MoneyPrecision: 100,
 		SettleOffset: 2, SettlementBalanceID: "bln_settle", MarketBalanceID: "bln_market",
 		Reference: "sell_002",
 	})

@@ -286,18 +286,52 @@ func TestComputeTradable_Scenario(t *testing.T) {
 	})
 }
 
+func TestPreciseQuantityAndMoney(t *testing.T) {
+	t.Run("whole shares", func(t *testing.T) {
+		q, err := PreciseQuantity("100", 1)
+		assert.NoError(t, err)
+		assert.Equal(t, int64(100), q.Int64())
+	})
+	t.Run("fractional quantity at precision", func(t *testing.T) {
+		// 1.5 @ precision 1000 -> 1500 (exact, no float drift)
+		q, err := PreciseQuantity("1.5", 1000)
+		assert.NoError(t, err)
+		assert.Equal(t, int64(1500), q.Int64())
+	})
+	t.Run("money = price * quantity in minor units", func(t *testing.T) {
+		// 180.00 * 50 = 9000.00 -> 900000 cents
+		m, err := PreciseMoney("50", "180.00", 100)
+		assert.NoError(t, err)
+		assert.Equal(t, int64(900000), m.Int64())
+	})
+	t.Run("rejects invalid / non-positive", func(t *testing.T) {
+		_, err := PreciseQuantity("abc", 1)
+		assert.Error(t, err)
+		_, err = PreciseQuantity("0", 1)
+		assert.Error(t, err)
+		_, err = PreciseQuantity("10", 0)
+		assert.Error(t, err)
+		_, err = PreciseMoney("10", "bad", 100)
+		assert.Error(t, err)
+	})
+}
+
 func TestTradeBookingValidate(t *testing.T) {
 	valid := TradeBooking{
 		LedgerID: "ldg", IdentityID: "idn", AccountRef: "acc",
 		Instrument: "KZAP", Venue: "KASE", Currency: "KZT",
-		Quantity: 100, QuantityPrecision: 1, Price: "19000.00", MoneyPrecision: 100,
+		Quantity: "100", QuantityPrecision: 1, Price: "19000.00", MoneyPrecision: 100,
 		SettleOffset: 2, SettlementBalanceID: "bln_settle", MarketBalanceID: "bln_market",
 		Reference: "trade_001",
 	}
 	assert.NoError(t, valid.Validate())
 
 	invalid := valid
-	invalid.Quantity = 0
+	invalid.Quantity = "0"
+	assert.Error(t, invalid.Validate())
+
+	invalid = valid
+	invalid.Quantity = "not-a-number"
 	assert.Error(t, invalid.Validate())
 
 	invalid = valid

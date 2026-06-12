@@ -199,10 +199,10 @@ type BookTradeRequest struct {
 	Venue      string `json:"venue"`
 	Currency   string `json:"currency"`
 
-	Quantity          float64 `json:"quantity"`
-	QuantityPrecision float64 `json:"quantity_precision"`
-	Price             string  `json:"price"`
-	MoneyPrecision    float64 `json:"money_precision"`
+	Quantity          string `json:"quantity"`
+	QuantityPrecision int    `json:"quantity_precision"`
+	Price             string `json:"price"`
+	MoneyPrecision    int    `json:"money_precision"`
 
 	SettleOffset int    `json:"settle_offset"`
 	TradeDate    string `json:"trade_date"`
@@ -298,10 +298,10 @@ type SellTradeRequest struct {
 	Venue      string `json:"venue"`
 	Currency   string `json:"currency"`
 
-	Quantity          float64 `json:"quantity"`
-	QuantityPrecision float64 `json:"quantity_precision"`
-	Price             string  `json:"price"`
-	MoneyPrecision    float64 `json:"money_precision"`
+	Quantity          string `json:"quantity"`
+	QuantityPrecision int    `json:"quantity_precision"`
+	Price             string `json:"price"`
+	MoneyPrecision    int    `json:"money_precision"`
 
 	SettleOffset int    `json:"settle_offset"`
 	TradeDate    string `json:"trade_date"`

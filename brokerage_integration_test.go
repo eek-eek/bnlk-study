@@ -125,7 +125,7 @@ func TestBrokerageChain_BuyT2ThenSellExceedingSettled(t *testing.T) {
 	seed, err := service.BookTrade(ctx, model.TradeBooking{
 		LedgerID: ledgerID, IdentityID: identityID, AccountRef: accountRef,
 		Instrument: instrument, Venue: venue, Currency: currency,
-		Quantity: 100, QuantityPrecision: 1, Price: "150.00", MoneyPrecision: 100,
+		Quantity: "100", QuantityPrecision: 1, Price: "150.00", MoneyPrecision: 100,
 		SettleOffset: 2, SettlementBalanceID: settlement.BalanceID, MarketBalanceID: market.BalanceID,
 		Reference: seedRef, TradeDate: time.Now().AddDate(0, 0, -5),
 	})
@@ -141,7 +141,7 @@ func TestBrokerageChain_BuyT2ThenSellExceedingSettled(t *testing.T) {
 	buy, err := service.BookTrade(ctx, model.TradeBooking{
 		LedgerID: ledgerID, IdentityID: identityID, AccountRef: accountRef,
 		Instrument: instrument, Venue: venue, Currency: currency,
-		Quantity: 50, QuantityPrecision: 1, Price: "180.00", MoneyPrecision: 100,
+		Quantity: "50", QuantityPrecision: 1, Price: "180.00", MoneyPrecision: 100,
 		SettleOffset: 2, SettlementBalanceID: settlement.BalanceID, MarketBalanceID: market.BalanceID,
 		Reference: "buy-50",
 	})
@@ -157,7 +157,7 @@ func TestBrokerageChain_BuyT2ThenSellExceedingSettled(t *testing.T) {
 	sell, err := service.SellTrade(ctx, model.SellBooking{
 		LedgerID: ledgerID, IdentityID: identityID, AccountRef: accountRef,
 		Instrument: instrument, Venue: venue, Currency: currency,
-		Quantity: 125, QuantityPrecision: 1, Price: "185.00", MoneyPrecision: 100,
+		Quantity: "125", QuantityPrecision: 1, Price: "185.00", MoneyPrecision: 100,
 		SettleOffset: 2, SettlementBalanceID: settlement.BalanceID, MarketBalanceID: market.BalanceID,
 		Reference: "sell-125",
 	})
@@ -168,7 +168,7 @@ func TestBrokerageChain_BuyT2ThenSellExceedingSettled(t *testing.T) {
 	_, err = service.SellTrade(ctx, model.SellBooking{
 		LedgerID: ledgerID, IdentityID: identityID, AccountRef: accountRef,
 		Instrument: instrument, Venue: venue, Currency: currency,
-		Quantity: 26, QuantityPrecision: 1, Price: "185.00", MoneyPrecision: 100,
+		Quantity: "26", QuantityPrecision: 1, Price: "185.00", MoneyPrecision: 100,
 		SettleOffset: 2, SettlementBalanceID: settlement.BalanceID, MarketBalanceID: market.BalanceID,
 		Reference: "sell-26",
 	})
@@ -227,14 +227,14 @@ func TestBrokerageChain_MultiDaySeparateBuckets(t *testing.T) {
 	tuesday := monday.AddDate(0, 0, 1)
 	buyMon, err := service.BookTrade(ctx, model.TradeBooking{
 		LedgerID: ledgerID, AccountRef: accountRef, Instrument: instrument, Venue: venue, Currency: currency,
-		Quantity: 10, QuantityPrecision: 1, Price: "100.00", MoneyPrecision: 100,
+		Quantity: "10", QuantityPrecision: 1, Price: "100.00", MoneyPrecision: 100,
 		SettleOffset: 2, TradeDate: monday, SettlementBalanceID: settlement.BalanceID, MarketBalanceID: market.BalanceID,
 		Reference: "buy-mon",
 	})
 	require.NoError(t, err)
 	buyTue, err := service.BookTrade(ctx, model.TradeBooking{
 		LedgerID: ledgerID, AccountRef: accountRef, Instrument: instrument, Venue: venue, Currency: currency,
-		Quantity: 20, QuantityPrecision: 1, Price: "100.00", MoneyPrecision: 100,
+		Quantity: "20", QuantityPrecision: 1, Price: "100.00", MoneyPrecision: 100,
 		SettleOffset: 2, TradeDate: tuesday, SettlementBalanceID: settlement.BalanceID, MarketBalanceID: market.BalanceID,
 		Reference: "buy-tue",
 	})
@@ -262,7 +262,7 @@ func TestBrokerageChain_MultiDaySeparateBuckets(t *testing.T) {
 	explicit := time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)
 	buyExplicit, err := service.BookTrade(ctx, model.TradeBooking{
 		LedgerID: ledgerID, AccountRef: accountRef, Instrument: instrument, Venue: venue, Currency: currency,
-		Quantity: 5, QuantityPrecision: 1, Price: "100.00", MoneyPrecision: 100,
+		Quantity: "5", QuantityPrecision: 1, Price: "100.00", MoneyPrecision: 100,
 		SettleDate: explicit, SettlementBalanceID: settlement.BalanceID, MarketBalanceID: market.BalanceID,
 		Reference: "buy-explicit",
 	})
@@ -312,7 +312,7 @@ func TestBrokerageChain_ExplicitSettleDateIncoming(t *testing.T) {
 	explicit := time.Date(2026, 7, 10, 0, 0, 0, 0, time.UTC)
 	_, err = service.BookTrade(ctx, model.TradeBooking{
 		LedgerID: ledgerID, AccountRef: accountRef, Instrument: instrument, Venue: venue, Currency: currency,
-		Quantity: 10, QuantityPrecision: 1, Price: "500.00", MoneyPrecision: 100,
+		Quantity: "10", QuantityPrecision: 1, Price: "500.00", MoneyPrecision: 100,
 		SettleDate: explicit, SettlementBalanceID: settlement.BalanceID, MarketBalanceID: market.BalanceID,
 		Reference: "buy-explicit-10",
 	})
@@ -359,7 +359,7 @@ func TestBrokerageChain_IdempotentResettlement(t *testing.T) {
 
 	buy, err := service.BookTrade(ctx, model.TradeBooking{
 		LedgerID: ledgerID, AccountRef: accountRef, Instrument: instrument, Venue: venue, Currency: currency,
-		Quantity: 40, QuantityPrecision: 1, Price: "100.00", MoneyPrecision: 100,
+		Quantity: "40", QuantityPrecision: 1, Price: "100.00", MoneyPrecision: 100,
 		SettleOffset: 2, SettlementBalanceID: settlement.BalanceID, MarketBalanceID: market.BalanceID,
 		Reference: "buy-idem",
 	})

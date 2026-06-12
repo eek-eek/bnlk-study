@@ -359,6 +359,40 @@ func RecalculateWAPrice(currentWA string, currentQty, tradeQty, tradeMoney decim
 	return numerator.Div(totalQty).RoundBank(2), nil
 }
 
+// PreciseQuantity converts an exact decimal quantity string into minor units
+// using the integer precision multiplier (e.g. "1.5" @ precision 100 -> 150).
+// It keeps the value path off float64.
+func PreciseQuantity(quantity string, precision int) (*big.Int, error) {
+	q, err := decimal.NewFromString(quantity)
+	if err != nil {
+		return nil, fmt.Errorf("invalid quantity %q: %w", quantity, err)
+	}
+	if q.Sign() <= 0 {
+		return nil, fmt.Errorf("quantity must be positive: %s", quantity)
+	}
+	if precision < 1 {
+		return nil, fmt.Errorf("precision must be >= 1, got %d", precision)
+	}
+	return q.Mul(decimal.NewFromInt(int64(precision))).Round(0).BigInt(), nil
+}
+
+// PreciseMoney converts price * quantity into minor units using the integer
+// money precision multiplier.
+func PreciseMoney(quantity, price string, precision int) (*big.Int, error) {
+	q, err := decimal.NewFromString(quantity)
+	if err != nil {
+		return nil, fmt.Errorf("invalid quantity %q: %w", quantity, err)
+	}
+	p, err := decimal.NewFromString(price)
+	if err != nil {
+		return nil, fmt.Errorf("invalid price %q: %w", price, err)
+	}
+	if precision < 1 {
+		return nil, fmt.Errorf("money precision must be >= 1, got %d", precision)
+	}
+	return p.Mul(q).Mul(decimal.NewFromInt(int64(precision))).Round(0).BigInt(), nil
+}
+
 // FreeBalance applies the TradeControl FreeBalanceAccountService thresholds:
 //
 //	d = sum1 - sum2            (available minus obligations)
@@ -417,13 +451,14 @@ type TradeBooking struct {
 	Venue      string `json:"venue"`
 	Currency   string `json:"currency"`
 
-	// Quantity of securities and its precision (units -> minor units factor).
-	Quantity          float64 `json:"quantity"`
-	QuantityPrecision float64 `json:"quantity_precision"`
+	// Quantity is an exact decimal string of securities; QuantityPrecision is
+	// the integer units -> minor units factor (e.g. 1 for whole shares).
+	Quantity          string `json:"quantity"`
+	QuantityPrecision int    `json:"quantity_precision"`
 	// Per-unit price as an exact decimal string; money amount = quantity * price.
 	Price string `json:"price"`
-	// Precision for the money leg (e.g. 100 for cents).
-	MoneyPrecision float64 `json:"money_precision"`
+	// Integer precision for the money leg (e.g. 100 for cents).
+	MoneyPrecision int `json:"money_precision"`
 
 	SettleOffset int       `json:"settle_offset"` // T+N (used when SettleDate is zero)
 	TradeDate    time.Time `json:"trade_date"`
@@ -448,14 +483,14 @@ func (t TradeBooking) Validate() error {
 	if t.Instrument == "" {
 		return fmt.Errorf("trade booking: instrument is required")
 	}
-	if t.Quantity <= 0 {
-		return fmt.Errorf("trade booking: quantity must be positive")
-	}
 	if t.QuantityPrecision < 1 {
 		return fmt.Errorf("trade booking: quantity_precision must be >= 1")
 	}
 	if t.MoneyPrecision < 1 {
 		return fmt.Errorf("trade booking: money_precision must be >= 1")
+	}
+	if _, err := PreciseQuantity(t.Quantity, t.QuantityPrecision); err != nil {
+		return fmt.Errorf("trade booking: %w", err)
 	}
 	if _, err := decimal.NewFromString(t.Price); err != nil {
 		return fmt.Errorf("trade booking: invalid price %q: %w", t.Price, err)
@@ -496,10 +531,10 @@ type SellBooking struct {
 	Venue      string `json:"venue"`
 	Currency   string `json:"currency"`
 
-	Quantity          float64 `json:"quantity"`
-	QuantityPrecision float64 `json:"quantity_precision"`
-	Price             string  `json:"price"`
-	MoneyPrecision    float64 `json:"money_precision"`
+	Quantity          string `json:"quantity"`
+	QuantityPrecision int    `json:"quantity_precision"`
+	Price             string `json:"price"`
+	MoneyPrecision    int    `json:"money_precision"`
 
 	// SettleOffset is the requested T+N; it is overridden by the instrument
 	// settings when those exist, and ignored when SettleDate is set.
@@ -525,14 +560,14 @@ func (s SellBooking) Validate() error {
 	if s.Instrument == "" {
 		return fmt.Errorf("sell booking: instrument is required")
 	}
-	if s.Quantity <= 0 {
-		return fmt.Errorf("sell booking: quantity must be positive")
-	}
 	if s.QuantityPrecision < 1 {
 		return fmt.Errorf("sell booking: quantity_precision must be >= 1")
 	}
 	if s.MoneyPrecision < 1 {
 		return fmt.Errorf("sell booking: money_precision must be >= 1")
+	}
+	if _, err := PreciseQuantity(s.Quantity, s.QuantityPrecision); err != nil {
+		return fmt.Errorf("sell booking: %w", err)
 	}
 	if _, err := decimal.NewFromString(s.Price); err != nil {
 		return fmt.Errorf("sell booking: invalid price %q: %w", s.Price, err)

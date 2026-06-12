@@ -251,13 +251,16 @@ func (l *Blnk) SellTrade(ctx context.Context, booking model.SellBooking) (*model
 	if err != nil {
 		return nil, err
 	}
-	qtyPrecise := model.ApplyPrecision(&model.Transaction{Amount: booking.Quantity, Precision: booking.QuantityPrecision})
+	qtyPrecise, err := model.PreciseQuantity(booking.Quantity, booking.QuantityPrecision)
+	if err != nil {
+		return nil, apierror.NewAPIError(apierror.ErrBadRequest, err.Error(), err)
+	}
 	if qtyPrecise.Cmp(tradable.Tradable) > 0 {
 		metrics.BrokerageSellRejectedTotal.Add(ctx, 1, otelmetric.WithAttributes(
 			attribute.String("reason", "insufficient_tradable"),
 			attribute.String("instrument", booking.Instrument)))
 		return nil, apierror.NewAPIError(apierror.ErrBadRequest, fmt.Sprintf(
-			"insufficient tradable quantity for %s: requested %v, available %s (settled %s, blocked %s, incoming %s, outgoing %s, on_the_way %t)",
+			"insufficient tradable quantity for %s: requested %s, available %s (settled %s, blocked %s, incoming %s, outgoing %s, on_the_way %t)",
 			booking.Instrument, booking.Quantity, tradable.Tradable.String(),
 			tradable.Settled.String(), tradable.Blocked.String(), tradable.Incoming.String(),
 			tradable.Outgoing.String(), tradable.OnTheWay), nil)
@@ -290,11 +293,10 @@ func (l *Blnk) SellTrade(ctx context.Context, booking model.SellBooking) (*model
 		return nil, err
 	}
 
-	price, err := decimal.NewFromString(booking.Price)
+	moneyPrecise, err := model.PreciseMoney(booking.Quantity, booking.Price, booking.MoneyPrecision)
 	if err != nil {
-		return nil, fmt.Errorf("invalid price %q: %w", booking.Price, err)
+		return nil, err
 	}
-	money := price.Mul(decimal.NewFromFloat(booking.Quantity))
 
 	sharedMeta := func(leg string) map[string]interface{} {
 		return map[string]interface{}{
@@ -311,17 +313,16 @@ func (l *Blnk) SellTrade(ctx context.Context, booking model.SellBooking) (*model
 
 	// Money leg: proceeds flow in from the broker settlement balance to the
 	// client money balance. The settlement balance funds the payout, so the
-	// outflow is allowed to overdraw it.
+	// outflow is allowed to overdraw it. Precise minor units keep float out.
 	moneyTxn := &model.Transaction{
 		TransactionID:  model.GenerateUUIDWithSuffix("txn"),
 		Source:         booking.SettlementBalanceID,
 		Destination:    moneyBalance.BalanceID,
-		Amount:         money.InexactFloat64(),
-		AmountString:   money.String(),
-		Precision:      booking.MoneyPrecision,
+		PreciseAmount:  moneyPrecise,
+		Precision:      float64(booking.MoneyPrecision),
 		Currency:       booking.Currency,
 		Reference:      booking.Reference + "_money",
-		Description:    fmt.Sprintf("Trade %s money leg: sell %v %s @ %s", booking.Reference, booking.Quantity, booking.Instrument, booking.Price),
+		Description:    fmt.Sprintf("Trade %s money leg: sell %s %s @ %s", booking.Reference, booking.Quantity, booking.Instrument, booking.Price),
 		Inflight:       true,
 		SkipQueue:      true,
 		AllowOverdraft: true,
@@ -338,12 +339,11 @@ func (l *Blnk) SellTrade(ctx context.Context, booking model.SellBooking) (*model
 		TransactionID:  model.GenerateUUIDWithSuffix("txn"),
 		Source:         deliverPosition.BalanceID,
 		Destination:    booking.MarketBalanceID,
-		Amount:         booking.Quantity,
-		AmountString:   decimal.NewFromFloat(booking.Quantity).String(),
-		Precision:      booking.QuantityPrecision,
+		PreciseAmount:  qtyPrecise,
+		Precision:      float64(booking.QuantityPrecision),
 		Currency:       booking.Currency,
 		Reference:      booking.Reference + "_sec",
-		Description:    fmt.Sprintf("Trade %s security leg: deliver %v %s (T+%d)", booking.Reference, booking.Quantity, booking.Instrument, params.settleOffset),
+		Description:    fmt.Sprintf("Trade %s security leg: deliver %s %s (T+%d)", booking.Reference, booking.Quantity, booking.Instrument, params.settleOffset),
 		Inflight:       true,
 		SkipQueue:      true,
 		AllowOverdraft: true, // covered by in-transit incoming, validated above
@@ -522,11 +522,14 @@ func (l *Blnk) BookTrade(ctx context.Context, booking model.TradeBooking) (*mode
 		return nil, err
 	}
 
-	price, err := decimal.NewFromString(booking.Price)
+	qtyPrecise, err := model.PreciseQuantity(booking.Quantity, booking.QuantityPrecision)
 	if err != nil {
-		return nil, fmt.Errorf("invalid price %q: %w", booking.Price, err)
+		return nil, apierror.NewAPIError(apierror.ErrBadRequest, err.Error(), err)
 	}
-	money := price.Mul(decimal.NewFromFloat(booking.Quantity))
+	moneyPrecise, err := model.PreciseMoney(booking.Quantity, booking.Price, booking.MoneyPrecision)
+	if err != nil {
+		return nil, err
+	}
 
 	sharedMeta := func(leg string) map[string]interface{} {
 		return map[string]interface{}{
@@ -545,12 +548,11 @@ func (l *Blnk) BookTrade(ctx context.Context, booking model.TradeBooking) (*mode
 		TransactionID: model.GenerateUUIDWithSuffix("txn"),
 		Source:        moneyBalance.BalanceID,
 		Destination:   booking.SettlementBalanceID,
-		Amount:        money.InexactFloat64(),
-		AmountString:  money.String(),
-		Precision:     booking.MoneyPrecision,
+		PreciseAmount: moneyPrecise,
+		Precision:     float64(booking.MoneyPrecision),
 		Currency:      booking.Currency,
 		Reference:     booking.Reference + "_money",
-		Description:   fmt.Sprintf("Trade %s money leg: buy %v %s @ %s", booking.Reference, booking.Quantity, booking.Instrument, booking.Price),
+		Description:   fmt.Sprintf("Trade %s money leg: buy %s %s @ %s", booking.Reference, booking.Quantity, booking.Instrument, booking.Price),
 		Inflight:      true,
 		SkipQueue:     true,
 		MetaData:      sharedMeta(model.TradeMetaLegMoney),
@@ -566,12 +568,11 @@ func (l *Blnk) BookTrade(ctx context.Context, booking model.TradeBooking) (*mode
 		TransactionID:  model.GenerateUUIDWithSuffix("txn"),
 		Source:         booking.MarketBalanceID,
 		Destination:    futurePosition.BalanceID,
-		Amount:         booking.Quantity,
-		AmountString:   decimal.NewFromFloat(booking.Quantity).String(),
-		Precision:      booking.QuantityPrecision,
+		PreciseAmount:  qtyPrecise,
+		Precision:      float64(booking.QuantityPrecision),
 		Currency:       booking.Currency,
 		Reference:      booking.Reference + "_sec",
-		Description:    fmt.Sprintf("Trade %s security leg: deliver %v %s (T+%d)", booking.Reference, booking.Quantity, booking.Instrument, params.settleOffset),
+		Description:    fmt.Sprintf("Trade %s security leg: deliver %s %s (T+%d)", booking.Reference, booking.Quantity, booking.Instrument, params.settleOffset),
 		Inflight:       true,
 		SkipQueue:      true,
 		AllowOverdraft: true, // the market counterparty balance may go short

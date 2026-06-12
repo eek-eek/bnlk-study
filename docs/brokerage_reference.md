@@ -539,3 +539,91 @@ flowchart TB
     end
 ```
 
+### 11.7. Жизненный цикл лега сделки (статусы транзакции)
+
+Каждый лег сделки — это inflight-транзакция Blnk. При букинге она ставит hold,
+при расчёте коммитится (полностью или частями), при отмене — войдится.
+
+```mermaid
+stateDiagram-v2
+    [*] --> INFLIGHT: RecordTransaction(inflight=true)
+
+    state "INFLIGHT (hold)" as INFLIGHT
+    state "APPLIED (рассчитан)" as Committed
+    state "VOID (отменён)" as Voided
+
+    INFLIGHT --> INFLIGHT: частичный commit (remaining > 0)
+    INFLIGHT --> Committed: полный commit (remaining = 0)
+    INFLIGHT --> Voided: void (остаток снят)
+    Committed --> [*]
+    Voided --> [*]
+
+    note right of INFLIGHT
+        Постановка hold:
+        source.inflight_debit += amount   (блокировка / расход в пути)
+        destination.inflight_credit += amount (приход в пути)
+    end note
+    note right of Committed
+        Commit (дочерняя APPLIED):
+        inflight_debit  → debit_balance   (источник списан)
+        inflight_credit → credit_balance  (получатель зачислен)
+    end note
+    note right of Voided
+        Void: inflight_* откатывается,
+        settled-баланс не меняется
+    end note
+```
+
+### 11.8. Компонентная схема (слои и зависимости)
+
+```mermaid
+flowchart TB
+    U["HTTP клиент / интеграция"]
+
+    subgraph api["API слой (Gin)"]
+        H["api/brokerage.go<br/>handlers /brokerage/*"]
+        DTO["api/model/brokerage.go<br/>DTO + валидация"]
+    end
+
+    subgraph svc["Сервис — методы *Blnk (brokerage.go)"]
+        BT["BookTrade / SellTrade"]
+        ST["SettleTrade / RunSettlement"]
+        TR["GetTradablePosition / GetFreeBalance"]
+        MP["ApplyMutationPlan"]
+        RH["RecalculateHolds"]
+        MD["model/brokerage.go<br/>ComputeTradable · RecalculateWAPrice<br/>ComputeSettleDate · MutationPlan"]
+    end
+
+    subgraph data["Доступ к данным (database/brokerage.go)"]
+        DS["IDataSource: интерфейс brokerage<br/>позиции · лоты · праздники · настройки<br/>SELECT … FOR UPDATE · каскад по дате"]
+    end
+
+    subgraph infra["Инфраструктура"]
+        PG[("PostgreSQL<br/>blnk.balances / balance_lots /<br/>market_holidays / instrument_settings")]
+        RD[("Redis<br/>распределённые локи")]
+    end
+
+    U --> H --> DTO
+    H --> BT
+    H --> ST
+    H --> TR
+    H --> MP
+    H --> RH
+    BT --> MD
+    ST --> MD
+    TR --> MD
+    BT --> DS
+    ST --> DS
+    TR --> DS
+    RH --> DS
+    MP --> DS
+    BT -. inflight-lock .-> RD
+    MP -. MultiLocker .-> RD
+    DS --> PG
+```
+
+> Зависимости направлены сверху вниз: API ничего не знает о БД, сервис
+> оперирует доменной моделью и интерфейсом `IDataSource`, а конкретный
+> `Datasource` инкапсулирует SQL. Redis используется только для блокировок,
+> PostgreSQL — единственный источник истины по балансам.
+

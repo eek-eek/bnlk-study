@@ -39,6 +39,21 @@ type IDataSource interface {
 	lineage        // Interface for fund lineage operations
 	chain          // Interface for hash-chain operations
 	brokerage      // Interface for brokerage balance operations
+	order          // Interface for order/dict/stop-list/trading-time operations
+}
+
+// order defines the order lifecycle and its reference data operations.
+type order interface {
+	CreateOrder(ctx context.Context, o model.Order) (*model.Order, error)                       // Creates a draft order
+	GetOrder(ctx context.Context, orderID string) (*model.Order, error)                         // Retrieves an order by ID
+	UpdateOrder(ctx context.Context, o *model.Order) error                                       // Persists order status/outcome
+	ListOrdersByStatus(ctx context.Context, status string, limit, offset int) ([]model.Order, error) // Lists orders in a status
+	UpsertDict(ctx context.Context, e model.DictEntry) (model.DictEntry, error)                  // Stores a configurable reference value
+	GetDict(ctx context.Context, category string) ([]model.DictEntry, error)                     // Lists reference values of a category
+	AddStopList(ctx context.Context, e model.StopListEntry) (model.StopListEntry, error)         // Blocks an identity (optionally per instrument)
+	IsStopListed(ctx context.Context, identityID, instrument string) (bool, string, error)       // Checks the stop list
+	SetTradingTime(ctx context.Context, w model.TradingTime) (model.TradingTime, error)          // Upserts a venue trading window
+	GetTradingTimes(ctx context.Context, venue string) ([]model.TradingTime, error)              // Lists a venue's trading windows
 }
 
 // transaction defines methods for handling transactions.

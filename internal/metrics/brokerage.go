@@ -35,6 +35,12 @@ var (
 
 	// BrokerageReconciledTotal counts settlement journals completed by recovery.
 	BrokerageReconciledTotal metric.Int64Counter
+
+	// OrderRejectedTotal counts orders rejected. Attributes: stage (check, execute)
+	OrderRejectedTotal metric.Int64Counter
+
+	// OrderExecutedTotal counts orders executed into a trade. Attributes: side
+	OrderExecutedTotal metric.Int64Counter
 )
 
 func init() {
@@ -83,6 +89,16 @@ func initBrokerage() error {
 	if BrokerageReconciledTotal, err = meter.Int64Counter("blnk.brokerage.settlement.reconciled.total",
 		metric.WithDescription("Total settlement journals completed by recovery"),
 		metric.WithUnit("{journal}")); err != nil {
+		return err
+	}
+	if OrderRejectedTotal, err = meter.Int64Counter("blnk.brokerage.order.rejected.total",
+		metric.WithDescription("Total orders rejected by stage"),
+		metric.WithUnit("{order}")); err != nil {
+		return err
+	}
+	if OrderExecutedTotal, err = meter.Int64Counter("blnk.brokerage.order.executed.total",
+		metric.WithDescription("Total orders executed into a trade by side"),
+		metric.WithUnit("{order}")); err != nil {
 		return err
 	}
 	return nil

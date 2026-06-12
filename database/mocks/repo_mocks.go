@@ -853,3 +853,70 @@ func (m *MockDataSource) ListPendingSettlementJournals(ctx context.Context, limi
 	}
 	return args.Get(0).([]model.SettlementJournalEntry), args.Error(1)
 }
+
+// --- Order operations ---
+
+func (m *MockDataSource) CreateOrder(ctx context.Context, o model.Order) (*model.Order, error) {
+	args := m.Called(ctx, o)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).(*model.Order), args.Error(1)
+}
+
+func (m *MockDataSource) GetOrder(ctx context.Context, orderID string) (*model.Order, error) {
+	args := m.Called(ctx, orderID)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).(*model.Order), args.Error(1)
+}
+
+func (m *MockDataSource) UpdateOrder(ctx context.Context, o *model.Order) error {
+	args := m.Called(ctx, o)
+	return args.Error(0)
+}
+
+func (m *MockDataSource) ListOrdersByStatus(ctx context.Context, status string, limit, offset int) ([]model.Order, error) {
+	args := m.Called(ctx, status, limit, offset)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).([]model.Order), args.Error(1)
+}
+
+func (m *MockDataSource) UpsertDict(ctx context.Context, e model.DictEntry) (model.DictEntry, error) {
+	args := m.Called(ctx, e)
+	return args.Get(0).(model.DictEntry), args.Error(1)
+}
+
+func (m *MockDataSource) GetDict(ctx context.Context, category string) ([]model.DictEntry, error) {
+	args := m.Called(ctx, category)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).([]model.DictEntry), args.Error(1)
+}
+
+func (m *MockDataSource) AddStopList(ctx context.Context, e model.StopListEntry) (model.StopListEntry, error) {
+	args := m.Called(ctx, e)
+	return args.Get(0).(model.StopListEntry), args.Error(1)
+}
+
+func (m *MockDataSource) IsStopListed(ctx context.Context, identityID, instrument string) (bool, string, error) {
+	args := m.Called(ctx, identityID, instrument)
+	return args.Bool(0), args.String(1), args.Error(2)
+}
+
+func (m *MockDataSource) SetTradingTime(ctx context.Context, w model.TradingTime) (model.TradingTime, error) {
+	args := m.Called(ctx, w)
+	return args.Get(0).(model.TradingTime), args.Error(1)
+}
+
+func (m *MockDataSource) GetTradingTimes(ctx context.Context, venue string) ([]model.TradingTime, error) {
+	args := m.Called(ctx, venue)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).([]model.TradingTime), args.Error(1)
+}

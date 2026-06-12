@@ -235,6 +235,9 @@ type InstrumentSettings struct {
 	Venue           string    `json:"venue,omitempty"`
 	TradesOnTheWay  bool      `json:"trades_on_the_way"`
 	SettleOffset    int       `json:"settle_offset"`
+	// Optional order-size limits (decimal strings; "" = no bound).
+	MinOrderQuantity string   `json:"min_order_quantity,omitempty"`
+	MaxOrderQuantity string   `json:"max_order_quantity,omitempty"`
 	CreatedAt       time.Time `json:"created_at"`
 	UpdatedAt       time.Time `json:"updated_at"`
 }

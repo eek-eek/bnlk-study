@@ -21,9 +21,11 @@
 ### С чего начать чтение (по приоритету)
 1. `docs/brokerage_reference.md` — **подробное** описание брокерского слоя:
    сервисы, таблицы, значения, логика расчётов, **8 Mermaid-диаграмм**.
-2. `docs/brokerage.md` — дизайн и маппинг «TradeControl → Blnk», матрица покрытия.
-3. Этот файл — карта кода, инварианты, как собирать/тестировать.
-4. `ОПИСАНИЕ.md` — обзор самого Blnk (на русском).
+2. `docs/orders.md` — слой ордеров («Trade Control»): жизненный цикл, статусы,
+   валидация (стоп-лист, окна торгов, лимиты, средства), исполнение в сделку.
+3. `docs/brokerage.md` — дизайн и маппинг «TradeControl → Blnk», матрица покрытия.
+4. Этот файл — карта кода, инварианты, как собирать/тестировать.
+5. `ОПИСАНИЕ.md` — обзор самого Blnk (на русском).
 
 ---
 
@@ -51,7 +53,9 @@
 | `sql/1781270635.sql` | миграция | индекс `idx_balances_settle_date` по `settle_date` (а не `settle_code`) |
 | `sql/1781270771.sql` | миграция | таблица `brokerage_settlement_journal` (двухфазный recovery расчёта) |
 | `sql/1781270772.sql` | миграция | идемпотентные лоты (unique `balance_lots(balance_id, reference)`) |
-| `internal/metrics/brokerage.go` | метрики | brokerage-инструменты (booked/rejected/settlement/reconciled/latency) |
+| `internal/metrics/brokerage.go` | метрики | brokerage + order инструменты (booked/rejected/settlement/reconciled/latency, order rejected/executed) |
+| `model/order.go`, `database/order.go`, `order.go`, `api/order.go`, `api/model/order.go` | слой ордеров | Order lifecycle, статусы (dict), валидация, стоп-лист, окна торгов |
+| `sql/1781272910.sql` | миграция | таблицы `orders`/`dict`/`stop_list`/`trading_times` + лимиты в `instrument_settings` |
 
 Модель данных и слои наглядно — в диаграммах `docs/brokerage_reference.md` §11.
 

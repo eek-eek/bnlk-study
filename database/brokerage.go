@@ -645,14 +645,22 @@ func (d Datasource) UpsertInstrumentSettings(ctx context.Context, settings model
 	if settings.Venue == "" {
 		venue = nil
 	}
+	var minQty, maxQty interface{}
+	if settings.MinOrderQuantity != "" {
+		minQty = settings.MinOrderQuantity
+	}
+	if settings.MaxOrderQuantity != "" {
+		maxQty = settings.MaxOrderQuantity
+	}
 	err := d.Conn.QueryRowContext(ctx, `
-        INSERT INTO blnk.instrument_settings (instrument, venue, trades_on_the_way, settle_offset, created_at, updated_at)
-        VALUES ($1, $2, $3, $4, $5, $5)
+        INSERT INTO blnk.instrument_settings (instrument, venue, trades_on_the_way, settle_offset, min_order_quantity, max_order_quantity, created_at, updated_at)
+        VALUES ($1, $2, $3, $4, $5::numeric, $6::numeric, $7, $7)
         ON CONFLICT (instrument) DO UPDATE
             SET venue = EXCLUDED.venue, trades_on_the_way = EXCLUDED.trades_on_the_way,
-                settle_offset = EXCLUDED.settle_offset, updated_at = EXCLUDED.updated_at
+                settle_offset = EXCLUDED.settle_offset, min_order_quantity = EXCLUDED.min_order_quantity,
+                max_order_quantity = EXCLUDED.max_order_quantity, updated_at = EXCLUDED.updated_at
         RETURNING id, created_at, updated_at`,
-		settings.Instrument, venue, settings.TradesOnTheWay, settings.SettleOffset, now,
+		settings.Instrument, venue, settings.TradesOnTheWay, settings.SettleOffset, minQty, maxQty, now,
 	).Scan(&settings.ID, &settings.CreatedAt, &settings.UpdatedAt)
 	if err != nil {
 		return model.InstrumentSettings{}, apierror.NewAPIError(apierror.ErrInternalServer, "Failed to upsert instrument settings", err)
@@ -664,12 +672,13 @@ func (d Datasource) UpsertInstrumentSettings(ctx context.Context, settings model
 // NotFound error when none is configured.
 func (d Datasource) GetInstrumentSettings(ctx context.Context, instrument string) (*model.InstrumentSettings, error) {
 	settings := &model.InstrumentSettings{}
-	var venue sql.NullString
+	var venue, minQty, maxQty sql.NullString
 	err := d.Conn.QueryRowContext(ctx, `
-        SELECT id, instrument, COALESCE(venue, ''), trades_on_the_way, settle_offset, created_at, updated_at
+        SELECT id, instrument, COALESCE(venue, ''), trades_on_the_way, settle_offset,
+               min_order_quantity::text, max_order_quantity::text, created_at, updated_at
         FROM blnk.instrument_settings WHERE instrument = $1`, instrument,
 	).Scan(&settings.ID, &settings.Instrument, &venue, &settings.TradesOnTheWay,
-		&settings.SettleOffset, &settings.CreatedAt, &settings.UpdatedAt)
+		&settings.SettleOffset, &minQty, &maxQty, &settings.CreatedAt, &settings.UpdatedAt)
 	if err == sql.ErrNoRows {
 		return nil, apierror.NewAPIError(apierror.ErrNotFound, fmt.Sprintf("No settings configured for instrument '%s'", instrument), err)
 	}
@@ -677,6 +686,8 @@ func (d Datasource) GetInstrumentSettings(ctx context.Context, instrument string
 		return nil, apierror.NewAPIError(apierror.ErrInternalServer, "Failed to scan instrument settings", err)
 	}
 	settings.Venue = venue.String
+	settings.MinOrderQuantity = minQty.String
+	settings.MaxOrderQuantity = maxQty.String
 	return settings, nil
 }
 

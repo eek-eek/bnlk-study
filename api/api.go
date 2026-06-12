@@ -84,6 +84,20 @@ func (a Api) Router() *gin.Engine {
 	router.GET("/brokerage/balances/:id/free", a.GetFreeBalance)
 	router.GET("/brokerage/balances/:id/lots", a.GetBalanceLots)
 
+	// Order lifecycle + reference data (TradeControl decision core)
+	router.POST("/orders", a.CreateOrder)
+	router.POST("/orders/submit", a.SubmitOrder)
+	router.GET("/orders/:id", a.GetOrder)
+	router.POST("/orders/:id/check", a.CheckOrder)
+	router.POST("/orders/:id/approve", a.ApproveOrder)
+	router.POST("/orders/:id/execute", a.ExecuteOrder)
+	router.POST("/orders/:id/cancel", a.CancelOrder)
+	router.POST("/dicts", a.UpsertDict)
+	router.GET("/dicts/:category", a.GetDict)
+	router.POST("/stop-list", a.AddStopList)
+	router.POST("/trading-times", a.SetTradingTime)
+	router.GET("/trading-times/:venue", a.GetTradingTimes)
+
 	// Balance Monitor routes
 	router.POST("/balance-monitors", a.CreateBalanceMonitor)
 	router.GET("/balance-monitors/:id", a.GetBalanceMonitor)

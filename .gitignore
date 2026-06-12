@@ -1,0 +1,13 @@
+blnk
+*/node_modules
+node_modules
+.env
+.idea
+blnk.json
+promtail
+dump.rdb
+heartbeat.db
+.claude
+CLAUDE.md
+# Local session settings (not part of upstream blnk)
+.claude/settings.local.json

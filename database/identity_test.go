@@ -1,0 +1,534 @@
+/*
+Copyright 2024 Blnk Finance Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+	http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package database
+
+import (
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"testing"
+	"time"
+
+	"github.com/DATA-DOG/go-sqlmock"
+	"github.com/blnkfinance/blnk/internal/apierror"
+	"github.com/blnkfinance/blnk/model"
+	"github.com/lib/pq"
+	"github.com/stretchr/testify/assert"
+)
+
+func TestCreateIdentity_Success(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	assert.NoError(t, err)
+	defer func() { _ = db.Close() }()
+
+	ds := Datasource{Conn: db}
+
+	identity := model.Identity{
+		IdentityType:     "individual",
+		FirstName:        "John",
+		LastName:         "Doe",
+		OtherNames:       "JD",
+		Gender:           "Male",
+		DOB:              time.Now(),
+		EmailAddress:     "john.doe@example.com",
+		PhoneNumber:      "123456789",
+		Nationality:      "US",
+		OrganizationName: "Acme Corp",
+		Category:         "Customer",
+		Street:           "123 Main St",
+		Country:          "USA",
+		State:            "CA",
+		PostCode:         "90210",
+		City:             "Los Angeles",
+		MetaData: map[string]interface{}{
+			"key": "value",
+		},
+	}
+
+	metaDataJSON, err := json.Marshal(identity.MetaData)
+	assert.NoError(t, err)
+
+	mock.ExpectExec("INSERT INTO blnk.identity").
+		WithArgs(sqlmock.AnyArg(), identity.IdentityType, identity.FirstName, identity.LastName, identity.OtherNames, identity.Gender, identity.DOB, identity.EmailAddress, identity.PhoneNumber, identity.Nationality, identity.OrganizationName, identity.Category, identity.Street, identity.Country, identity.State, identity.PostCode, identity.City, sqlmock.AnyArg(), metaDataJSON).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+
+	createdIdentity, err := ds.CreateIdentity(identity)
+	assert.NoError(t, err)
+	assert.NotEmpty(t, createdIdentity.IdentityID)
+	assert.WithinDuration(t, time.Now(), createdIdentity.CreatedAt, time.Second)
+}
+
+func TestCreateIdentity_Fail(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	assert.NoError(t, err)
+	defer func() { _ = db.Close() }()
+
+	ds := Datasource{Conn: db}
+
+	identity := model.Identity{
+		IdentityType: "individual",
+		FirstName:    "John",
+		LastName:     "Doe",
+	}
+
+	mock.ExpectExec("INSERT INTO blnk.identity").
+		WithArgs(sqlmock.AnyArg(), identity.IdentityType, identity.FirstName, identity.LastName, sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WillReturnError(fmt.Errorf("failed to insert"))
+
+	_, err = ds.CreateIdentity(identity)
+	assert.Error(t, err)
+	assert.Equal(t, apierror.ErrInternalServer, err.(apierror.APIError).Code)
+}
+
+func TestCreateIdentity_CallerSuppliedID_Preserved(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	assert.NoError(t, err)
+	defer func() { _ = db.Close() }()
+
+	ds := Datasource{Conn: db}
+
+	const callerID = "idt_8c5a8e2f-3f1d-5a9b-9c3e-4d8f1e5a7b2c"
+	identity := model.Identity{
+		IdentityID:   callerID,
+		IdentityType: "individual",
+		FirstName:    "John",
+		LastName:     "Doe",
+	}
+
+	mock.ExpectExec("INSERT INTO blnk.identity").
+		WithArgs(callerID, identity.IdentityType, identity.FirstName, identity.LastName, sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+
+	created, err := ds.CreateIdentity(identity)
+	assert.NoError(t, err)
+	assert.Equal(t, callerID, created.IdentityID, "caller-supplied identity_id must be preserved")
+}
+
+func TestCreateIdentity_CallerSuppliedID_BadPrefix(t *testing.T) {
+	db, _, err := sqlmock.New()
+	assert.NoError(t, err)
+	defer func() { _ = db.Close() }()
+
+	ds := Datasource{Conn: db}
+
+	identity := model.Identity{
+		IdentityID:   "user_123", // missing idt_ prefix
+		IdentityType: "individual",
+		FirstName:    "John",
+		LastName:     "Doe",
+	}
+
+	_, err = ds.CreateIdentity(identity)
+	assert.Error(t, err)
+	assert.Equal(t, apierror.ErrBadRequest, err.(apierror.APIError).Code)
+}
+
+func TestCreateIdentity_CallerSuppliedID_BadUUID(t *testing.T) {
+	db, _, err := sqlmock.New()
+	assert.NoError(t, err)
+	defer func() { _ = db.Close() }()
+
+	ds := Datasource{Conn: db}
+
+	cases := []string{
+		"idt_",                                       // empty suffix
+		"idt_not-a-uuid",                             // non-UUID suffix
+		"idt_8c5a8e2f-3f1d-5a9b-9c3e-4d8f1e5a7b2",    // truncated UUID
+		"idt_8c5a8e2f-3f1d-5a9b-9c3e-4d8f1e5a7b2cZZ", // trailing garbage
+		"idt_xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",   // non-hex chars
+	}
+
+	for _, id := range cases {
+		identity := model.Identity{
+			IdentityID:   id,
+			IdentityType: "individual",
+			FirstName:    "John",
+			LastName:     "Doe",
+		}
+		_, err := ds.CreateIdentity(identity)
+		assert.Error(t, err, "expected error for id %q", id)
+		if apiErr, ok := err.(apierror.APIError); ok {
+			assert.Equal(t, apierror.ErrBadRequest, apiErr.Code, "expected 400 for id %q", id)
+		} else {
+			t.Errorf("expected apierror.APIError for id %q, got %T", id, err)
+		}
+	}
+}
+
+func TestCreateIdentity_CallerSuppliedID_DuplicateConflict(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	assert.NoError(t, err)
+	defer func() { _ = db.Close() }()
+
+	ds := Datasource{Conn: db}
+
+	const callerID = "idt_8c5a8e2f-3f1d-5a9b-9c3e-4d8f1e5a7b2c"
+	identity := model.Identity{
+		IdentityID:   callerID,
+		IdentityType: "individual",
+		FirstName:    "John",
+		LastName:     "Doe",
+	}
+
+	mock.ExpectExec("INSERT INTO blnk.identity").
+		WithArgs(callerID, identity.IdentityType, identity.FirstName, identity.LastName, sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WillReturnError(&pq.Error{Code: "23505", Message: "unique_violation"})
+
+	_, err = ds.CreateIdentity(identity)
+	assert.Error(t, err)
+	assert.Equal(t, apierror.ErrConflict, err.(apierror.APIError).Code)
+}
+
+func TestGetIdentityByID_NotFound(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	assert.NoError(t, err)
+	defer func() { _ = db.Close() }()
+
+	ds := Datasource{Conn: db}
+
+	mock.ExpectBegin()
+	mock.ExpectQuery("SELECT identity_id, identity_type, first_name, last_name").
+		WithArgs("idt123").
+		WillReturnError(sql.ErrNoRows)
+	mock.ExpectRollback()
+
+	_, err = ds.GetIdentityByID("idt123")
+	assert.Error(t, err)
+	assert.Equal(t, apierror.ErrNotFound, err.(apierror.APIError).Code)
+}
+
+func TestGetIdentityByID_Success(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	assert.NoError(t, err)
+	defer func() { _ = db.Close() }()
+
+	ds := Datasource{Conn: db}
+
+	expectedIdentity := &model.Identity{
+		IdentityID:       "idt123",
+		IdentityType:     "individual",
+		FirstName:        "John",
+		LastName:         "Doe",
+		OtherNames:       "JD",
+		Gender:           "Male",
+		DOB:              time.Now(),
+		EmailAddress:     "john.doe@example.com",
+		PhoneNumber:      "123456789",
+		Nationality:      "US",
+		OrganizationName: "Acme Corp",
+		Category:         "Customer",
+		Street:           "123 Main St",
+		Country:          "USA",
+		State:            "CA",
+		PostCode:         "90210",
+		City:             "Los Angeles",
+		MetaData: map[string]interface{}{
+			"key": "value",
+		},
+	}
+
+	metaDataJSON, _ := json.Marshal(expectedIdentity.MetaData)
+
+	mock.ExpectBegin()
+	mock.ExpectQuery("SELECT identity_id, identity_type, first_name, last_name, other_names, gender, dob, email_address, phone_number, nationality, organization_name, category, street, country, state, post_code, city, created_at, meta_data").
+		WithArgs("idt123").
+		WillReturnRows(sqlmock.NewRows([]string{
+			"identity_id", "identity_type", "first_name", "last_name", "other_names", "gender", "dob", "email_address", "phone_number", "nationality", "organization_name", "category", "street", "country", "state", "post_code", "city", "created_at", "meta_data",
+		}).AddRow(expectedIdentity.IdentityID, expectedIdentity.IdentityType, expectedIdentity.FirstName, expectedIdentity.LastName, expectedIdentity.OtherNames, expectedIdentity.Gender, expectedIdentity.DOB, expectedIdentity.EmailAddress, expectedIdentity.PhoneNumber, expectedIdentity.Nationality, expectedIdentity.OrganizationName, expectedIdentity.Category, expectedIdentity.Street, expectedIdentity.Country, expectedIdentity.State, expectedIdentity.PostCode, expectedIdentity.City, expectedIdentity.CreatedAt, metaDataJSON))
+	mock.ExpectCommit()
+
+	identity, err := ds.GetIdentityByID("idt123")
+	assert.NoError(t, err)
+	assert.Equal(t, expectedIdentity.IdentityID, identity.IdentityID)
+	assert.Equal(t, expectedIdentity.FirstName, identity.FirstName)
+	assert.Equal(t, expectedIdentity.LastName, identity.LastName)
+	assert.Equal(t, expectedIdentity.MetaData, identity.MetaData)
+}
+
+func TestGetAllIdentities_Success(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	assert.NoError(t, err)
+	defer func() { _ = db.Close() }()
+
+	ds := Datasource{Conn: db}
+
+	expectedIdentities := []model.Identity{
+		{
+			IdentityID:       "idt1",
+			FirstName:        "John",
+			LastName:         "Doe",
+			OtherNames:       "JD",
+			Gender:           "Male",
+			DOB:              time.Now(),
+			EmailAddress:     "john.doe@example.com",
+			PhoneNumber:      "123456789",
+			Nationality:      "US",
+			OrganizationName: "Acme Corp",
+			Category:         "Customer",
+			Street:           "123 Main St",
+			Country:          "USA",
+			State:            "CA",
+			PostCode:         "90210",
+			City:             "Los Angeles",
+			MetaData: map[string]interface{}{
+				"key": "value",
+			},
+		},
+		{
+			IdentityID:       "idt2",
+			FirstName:        "Jane",
+			LastName:         "Smith",
+			OtherNames:       "",
+			Gender:           "Female",
+			DOB:              time.Now(),
+			EmailAddress:     "jane.smith@example.com",
+			PhoneNumber:      "987654321",
+			Nationality:      "US",
+			OrganizationName: "XYZ Corp",
+			Category:         "Supplier",
+			Street:           "456 Market St",
+			Country:          "USA",
+			State:            "CA",
+			PostCode:         "94105",
+			City:             "San Francisco",
+			MetaData: map[string]interface{}{
+				"key2": "value2",
+			},
+		},
+	}
+
+	// Properly marshal the metadata to JSON strings
+	metaData1, err := json.Marshal(expectedIdentities[0].MetaData)
+	assert.NoError(t, err)
+	metaData2, err := json.Marshal(expectedIdentities[1].MetaData)
+	assert.NoError(t, err)
+
+	// Mock the query result to return all 19 columns
+	mock.ExpectQuery("SELECT identity_id, identity_type, first_name, last_name, other_names, gender, dob, email_address, phone_number, nationality, organization_name, category, street, country, state, post_code, city, created_at, meta_data").
+		WillReturnRows(sqlmock.NewRows([]string{
+			"identity_id", "identity_type", "first_name", "last_name", "other_names", "gender", "dob", "email_address", "phone_number", "nationality", "organization_name", "category", "street", "country", "state", "post_code", "city", "created_at", "meta_data",
+		}).
+			AddRow(expectedIdentities[0].IdentityID, expectedIdentities[0].IdentityType, expectedIdentities[0].FirstName, expectedIdentities[0].LastName, expectedIdentities[0].OtherNames, expectedIdentities[0].Gender, expectedIdentities[0].DOB, expectedIdentities[0].EmailAddress, expectedIdentities[0].PhoneNumber, expectedIdentities[0].Nationality, expectedIdentities[0].OrganizationName, expectedIdentities[0].Category, expectedIdentities[0].Street, expectedIdentities[0].Country, expectedIdentities[0].State, expectedIdentities[0].PostCode, expectedIdentities[0].City, expectedIdentities[0].CreatedAt, metaData1).
+			AddRow(expectedIdentities[1].IdentityID, expectedIdentities[1].IdentityType, expectedIdentities[1].FirstName, expectedIdentities[1].LastName, expectedIdentities[1].OtherNames, expectedIdentities[1].Gender, expectedIdentities[1].DOB, expectedIdentities[1].EmailAddress, expectedIdentities[1].PhoneNumber, expectedIdentities[1].Nationality, expectedIdentities[1].OrganizationName, expectedIdentities[1].Category, expectedIdentities[1].Street, expectedIdentities[1].Country, expectedIdentities[1].State, expectedIdentities[1].PostCode, expectedIdentities[1].City, expectedIdentities[1].CreatedAt, metaData2))
+
+	// Execute the function under test
+	identities, err := ds.GetAllIdentities()
+	assert.NoError(t, err)
+	assert.Len(t, identities, 2)
+	assert.Equal(t, expectedIdentities[0].IdentityID, identities[0].IdentityID)
+	assert.Equal(t, expectedIdentities[1].IdentityID, identities[1].IdentityID)
+}
+
+func TestUpdateIdentity_Success(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	assert.NoError(t, err)
+	defer func() { _ = db.Close() }()
+
+	ds := Datasource{Conn: db}
+
+	identity := &model.Identity{
+		IdentityID:   "idt1",
+		FirstName:    "John",
+		LastName:     "Doe",
+		EmailAddress: "john.doe@example.com",
+		MetaData: map[string]interface{}{
+			"key": "value",
+		},
+	}
+
+	// Marshal the metadata since it needs to be passed as an argument
+	metaDataJSON, err := json.Marshal(identity.MetaData)
+	assert.NoError(t, err)
+
+	// Match the exact column names and include meta_data
+	mock.ExpectExec("UPDATE blnk\\.identity SET").
+		WithArgs(identity.FirstName, identity.LastName, identity.EmailAddress, metaDataJSON, identity.IdentityID).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+
+	err = ds.UpdateIdentity(identity)
+	assert.NoError(t, err)
+}
+
+func TestUpdateIdentity_NoFieldsProvided(t *testing.T) {
+	db, _, err := sqlmock.New()
+	assert.NoError(t, err)
+	defer func() { _ = db.Close() }()
+
+	ds := Datasource{Conn: db}
+
+	identity := &model.Identity{
+		IdentityID: "idt1",
+	}
+
+	err = ds.UpdateIdentity(identity)
+	assert.Error(t, err)
+	assert.Equal(t, apierror.ErrBadRequest, err.(apierror.APIError).Code)
+}
+
+func TestUpdateIdentity_PartialUpdate(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	assert.NoError(t, err)
+	defer func() { _ = db.Close() }()
+
+	ds := Datasource{Conn: db}
+
+	identity := &model.Identity{
+		IdentityID:   "idt1",
+		EmailAddress: "new.email@example.com",
+		PhoneNumber:  "987654321",
+		MetaData: map[string]interface{}{
+			"key2": "value2",
+		},
+	}
+
+	// Marshal the metadata
+	metaDataJSON, err := json.Marshal(identity.MetaData)
+	assert.NoError(t, err)
+
+	// Use a more flexible pattern but account for meta_data
+	mock.ExpectExec("UPDATE blnk\\.identity SET").
+		WithArgs(identity.EmailAddress, identity.PhoneNumber, metaDataJSON, identity.IdentityID).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+
+	err = ds.UpdateIdentity(identity)
+	assert.NoError(t, err)
+}
+
+func TestDeleteIdentity_Success(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	assert.NoError(t, err)
+	defer func() { _ = db.Close() }()
+
+	ds := Datasource{Conn: db}
+
+	mock.ExpectExec("DELETE FROM blnk.identity").
+		WithArgs("idt123").
+		WillReturnResult(sqlmock.NewResult(1, 1))
+
+	err = ds.DeleteIdentity("idt123")
+	assert.NoError(t, err)
+}
+
+func TestDeleteIdentity_NotFound(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	assert.NoError(t, err)
+	defer func() { _ = db.Close() }()
+
+	ds := Datasource{Conn: db}
+
+	mock.ExpectExec("DELETE FROM blnk.identity").
+		WithArgs("idt123").
+		WillReturnResult(sqlmock.NewResult(1, 0))
+
+	err = ds.DeleteIdentity("idt123")
+	assert.Error(t, err)
+	assert.Equal(t, apierror.ErrNotFound, err.(apierror.APIError).Code)
+}
+
+func TestGetIdentityByID_QueryError(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	assert.NoError(t, err)
+	defer func() { _ = db.Close() }()
+
+	ds := Datasource{Conn: db}
+
+	mock.ExpectBegin()
+	mock.ExpectQuery("SELECT identity_id, identity_type, first_name, last_name").
+		WithArgs("idt123").
+		WillReturnError(fmt.Errorf("connection error"))
+	mock.ExpectRollback()
+
+	_, err = ds.GetIdentityByID("idt123")
+	assert.Error(t, err)
+	assert.Equal(t, apierror.ErrInternalServer, err.(apierror.APIError).Code)
+}
+
+func TestGetAllIdentities_QueryError(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	assert.NoError(t, err)
+	defer func() { _ = db.Close() }()
+
+	ds := Datasource{Conn: db}
+
+	mock.ExpectQuery("SELECT identity_id, identity_type, first_name, last_name").
+		WillReturnError(fmt.Errorf("database error"))
+
+	identities, err := ds.GetAllIdentities()
+	assert.Error(t, err)
+	assert.Nil(t, identities)
+	assert.Equal(t, apierror.ErrInternalServer, err.(apierror.APIError).Code)
+}
+
+func TestGetAllIdentities_Empty(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	assert.NoError(t, err)
+	defer func() { _ = db.Close() }()
+
+	ds := Datasource{Conn: db}
+
+	mock.ExpectQuery("SELECT identity_id, identity_type, first_name, last_name").
+		WillReturnRows(sqlmock.NewRows([]string{
+			"identity_id", "identity_type", "first_name", "last_name", "other_names", "gender",
+			"dob", "email_address", "phone_number", "nationality", "organization_name", "category",
+			"street", "country", "state", "post_code", "city", "created_at", "meta_data",
+		}))
+
+	identities, err := ds.GetAllIdentities()
+	assert.NoError(t, err)
+	assert.Len(t, identities, 0)
+}
+
+func TestUpdateIdentity_QueryError(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	assert.NoError(t, err)
+	defer func() { _ = db.Close() }()
+
+	ds := Datasource{Conn: db}
+
+	identity := &model.Identity{
+		IdentityID:   "idt1",
+		FirstName:    "John",
+		EmailAddress: "john@example.com",
+		MetaData:     map[string]interface{}{},
+	}
+
+	metaDataJSON, _ := json.Marshal(identity.MetaData)
+
+	mock.ExpectExec("UPDATE blnk\\.identity SET").
+		WithArgs(identity.FirstName, identity.EmailAddress, metaDataJSON, identity.IdentityID).
+		WillReturnError(fmt.Errorf("database error"))
+
+	err = ds.UpdateIdentity(identity)
+	assert.Error(t, err)
+	assert.Equal(t, apierror.ErrInternalServer, err.(apierror.APIError).Code)
+}
+
+func TestDeleteIdentity_QueryError(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	assert.NoError(t, err)
+	defer func() { _ = db.Close() }()
+
+	ds := Datasource{Conn: db}
+
+	mock.ExpectExec("DELETE FROM blnk.identity").
+		WithArgs("idt123").
+		WillReturnError(fmt.Errorf("database error"))
+
+	err = ds.DeleteIdentity("idt123")
+	assert.Error(t, err)
+	assert.Equal(t, apierror.ErrInternalServer, err.(apierror.APIError).Code)
+}

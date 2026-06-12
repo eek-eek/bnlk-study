@@ -1,0 +1,330 @@
+/*
+Copyright 2024 Blnk Finance Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+	http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package database
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"time"
+
+	"github.com/blnkfinance/blnk/internal/apierror"
+	"github.com/blnkfinance/blnk/internal/filter"
+	"github.com/blnkfinance/blnk/model"
+	"github.com/lib/pq"
+)
+
+// CreateLedger inserts a new ledger record into the database, ensuring metadata is properly marshaled into JSON format.
+// It assigns a unique ledger ID with a suffix and captures the current timestamp as the creation time.
+//
+// Parameters:
+// - ledger: The ledger data to be inserted into the database.
+//
+// Returns:
+// - model.Ledger: The created ledger object including the generated LedgerID and creation timestamp.
+// - error: An error if the ledger creation fails, including specific database error handling for conflicts.
+func (d Datasource) CreateLedger(ledger model.Ledger) (model.Ledger, error) {
+	// Marshal the metadata into JSON format
+	metaDataJSON, err := json.Marshal(ledger.MetaData)
+	if err != nil {
+		return model.Ledger{}, apierror.NewAPIError(apierror.ErrInternalServer, "Failed to marshal metadata", err)
+	}
+
+	// Assign a unique ledger ID and record the creation time
+	ledger.LedgerID = model.GenerateUUIDWithSuffix("ldg")
+	ledger.CreatedAt = time.Now()
+
+	// Insert the ledger into the database
+	_, err = d.Conn.ExecContext(context.Background(), `
+		INSERT INTO blnk.ledgers (meta_data, name, ledger_id)
+		VALUES ($1, $2, $3)
+	`, metaDataJSON, ledger.Name, ledger.LedgerID)
+	// Handle database errors, specifically unique constraint violations
+	if err != nil {
+		pqErr, ok := err.(*pq.Error)
+		if ok {
+			switch pqErr.Code.Name() {
+			case "unique_violation":
+				return model.Ledger{}, apierror.NewAPIError(apierror.ErrConflict, "Ledger with this name or ID already exists", err)
+			default:
+				return model.Ledger{}, apierror.NewAPIError(apierror.ErrInternalServer, "Database error occurred", err)
+			}
+		}
+		return model.Ledger{}, apierror.NewAPIError(apierror.ErrInternalServer, "Failed to create ledger", err)
+	}
+
+	return ledger, nil
+}
+
+// GetAllLedgers retrieves a paginated list of ledger records from the database, unmarshaling their metadata from JSON format.
+// This method supports pagination and can be used to efficiently retrieve all ledgers over multiple requests.
+//
+// Parameters:
+// - limit: The maximum number of ledgers to return (e.g., 20).
+// - offset: The offset to start fetching ledgers from (for pagination).
+//
+// Returns:
+// - []model.Ledger: A slice of ledgers retrieved from the database.
+// - error: An error if the query fails or if there's an issue processing the results.
+func (d Datasource) GetAllLedgers(limit, offset int) ([]model.Ledger, error) {
+	if limit <= 0 || limit > 100 {
+		limit = 20 // Default limit to 20 if the provided limit is invalid or too large
+	}
+
+	// Execute a paginated query to select ledgers from the database
+	query := `
+		SELECT ledger_id, name, created_at, meta_data
+		FROM blnk.ledgers
+		ORDER BY created_at DESC
+		LIMIT $1 OFFSET $2
+	`
+
+	rows, err := d.Conn.QueryContext(context.Background(), query, limit, offset)
+	if err != nil {
+		return nil, apierror.NewAPIError(apierror.ErrInternalServer, err.Error(), err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	ledgers := []model.Ledger{}
+
+	// Iterate through the query results, scanning each row into a ledger object
+	for rows.Next() {
+		ledger := model.Ledger{}
+		var metaDataJSON []byte
+		err = rows.Scan(&ledger.LedgerID, &ledger.Name, &ledger.CreatedAt, &metaDataJSON)
+		if err != nil {
+			return nil, apierror.NewAPIError(apierror.ErrInternalServer, "Failed to scan ledger data", err)
+		}
+
+		// Unmarshal the metadata JSON into the ledger's MetaData field
+		err = json.Unmarshal(metaDataJSON, &ledger.MetaData)
+		if err != nil {
+			return nil, apierror.NewAPIError(apierror.ErrInternalServer, "Failed to unmarshal metadata", err)
+		}
+
+		ledgers = append(ledgers, ledger)
+	}
+
+	// Check for any errors that occurred during the iteration of the rows
+	if err = rows.Err(); err != nil {
+		return nil, apierror.NewAPIError(apierror.ErrInternalServer, "Error occurred while iterating over ledgers", err)
+	}
+
+	return ledgers, nil
+}
+
+// GetLedgerByID retrieves a ledger record from the database by its ID.
+// It handles cases where the ledger is not found and unmarshals the metadata from JSON format.
+//
+// Parameters:
+// - id: The unique ID of the ledger to retrieve.
+//
+// Returns:
+// - *model.Ledger: The ledger object, if found.
+// - error: An error if the ledger is not found or if the query fails.
+func (d Datasource) GetLedgerByID(id string) (*model.Ledger, error) {
+	ledger := model.Ledger{}
+
+	// Query the database to find the ledger by its ID
+	row := d.Conn.QueryRowContext(context.Background(), `
+		SELECT ledger_id, name, created_at, meta_data
+		FROM blnk.ledgers
+		WHERE ledger_id = $1
+	`, id)
+
+	var metaDataJSON []byte
+	err := row.Scan(&ledger.LedgerID, &ledger.Name, &ledger.CreatedAt, &metaDataJSON)
+	if err != nil {
+		// Handle case where the ledger is not found
+		if err == sql.ErrNoRows {
+			return nil, apierror.NewAPIError(apierror.ErrNotFound, "Ledger not found", err)
+		}
+		return nil, apierror.NewAPIError(apierror.ErrInternalServer, "Failed to retrieve ledger", err)
+	}
+
+	// Unmarshal the metadata JSON into the ledger's MetaData field
+	err = json.Unmarshal(metaDataJSON, &ledger.MetaData)
+	if err != nil {
+		return nil, apierror.NewAPIError(apierror.ErrInternalServer, "Failed to unmarshal metadata", err)
+	}
+
+	return &ledger, nil
+}
+
+// UpdateLedger updates an existing ledger's name in the database.
+// It validates that the ledger exists and updates only the name field.
+//
+// Parameters:
+// - id: The unique ID of the ledger to update.
+// - name: The new name for the ledger.
+//
+// Returns:
+// - *model.Ledger: The updated ledger object.
+// - error: An error if the ledger is not found or if the update fails.
+func (d Datasource) UpdateLedger(id, name string) (*model.Ledger, error) {
+	// First, check if the ledger exists
+	existingLedger, err := d.GetLedgerByID(id)
+	if err != nil {
+		return nil, err
+	}
+
+	// Update the ledger name
+	_, err = d.Conn.ExecContext(context.Background(), `
+		UPDATE blnk.ledgers 
+		SET name = $1 
+		WHERE ledger_id = $2
+	`, name, id)
+	if err != nil {
+		pqErr, ok := err.(*pq.Error)
+		if ok {
+			switch pqErr.Code.Name() {
+			case "unique_violation":
+				return nil, apierror.NewAPIError(apierror.ErrConflict, "Ledger with this name already exists", err)
+			default:
+				return nil, apierror.NewAPIError(apierror.ErrInternalServer, "Database error occurred", err)
+			}
+		}
+		return nil, apierror.NewAPIError(apierror.ErrInternalServer, "Failed to update ledger", err)
+	}
+
+	// Update the existing ledger object with the new name
+	existingLedger.Name = name
+
+	return existingLedger, nil
+}
+
+// GetAllLedgersWithFilter retrieves ledgers with advanced filtering support.
+// It delegates to GetAllLedgersWithFilterAndOptions with nil options.
+//
+// Parameters:
+// - ctx: Context for the database operation.
+// - filters: A QueryFilterSet containing the filter conditions.
+// - limit: The maximum number of ledgers to return.
+// - offset: The offset to start fetching ledgers from (for pagination).
+//
+// Returns:
+// - []model.Ledger: A slice of ledgers matching the filter criteria.
+// - error: An error if the query fails or if there's an issue processing the results.
+func (d Datasource) GetAllLedgersWithFilter(ctx context.Context, filters *filter.QueryFilterSet, limit, offset int) ([]model.Ledger, error) {
+	ledgers, _, err := d.GetAllLedgersWithFilterAndOptions(ctx, filters, nil, limit, offset)
+	return ledgers, err
+}
+
+// GetAllLedgersWithFilterAndOptions retrieves ledgers with filtering, sorting, and optional count.
+// It uses the filter package to build SQL WHERE and ORDER BY conditions.
+//
+// Parameters:
+// - ctx: Context for the database operation.
+// - filters: A QueryFilterSet containing the filter conditions.
+// - opts: Query options including sorting and count settings.
+// - limit: The maximum number of ledgers to return.
+// - offset: The offset to start fetching ledgers from (for pagination).
+//
+// Returns:
+// - []model.Ledger: A slice of ledgers matching the filter criteria.
+// - *int64: Optional total count of matching records (if opts.IncludeCount is true).
+// - error: An error if the query fails or if there's an issue processing the results.
+func (d Datasource) GetAllLedgersWithFilterAndOptions(ctx context.Context, filters *filter.QueryFilterSet, opts *filter.QueryOptions, limit, offset int) ([]model.Ledger, *int64, error) {
+	if limit <= 0 || limit > 100 {
+		limit = 20
+	}
+
+	if opts == nil {
+		opts = &filter.QueryOptions{}
+	}
+	if err := filter.ValidateSortByForTable(opts, "ledgers"); err != nil {
+		return nil, nil, apierror.NewAPIError(apierror.ErrBadRequest, "Invalid sort_by field", nil)
+	}
+
+	result, err := filter.BuildWithOptions(filters, "ledgers", "", 1, opts)
+	if err != nil {
+		return nil, nil, apierror.NewAPIError(apierror.ErrBadRequest, fmt.Sprintf("Invalid filter: %s", err.Error()), err)
+	}
+
+	// Determine select fields based on whether count is requested
+	selectFields := "ledger_id, name, created_at, meta_data"
+	if opts != nil && opts.IncludeCount {
+		selectFields = "ledger_id, name, created_at, meta_data, COUNT(*) OVER() AS total_count"
+	}
+
+	// Build base query
+	baseQuery := fmt.Sprintf(`
+		SELECT %s
+		FROM blnk.ledgers
+	`, selectFields)
+
+	var args []interface{}
+	args = append(args, result.Args...)
+	argPos := result.NextArgPos
+
+	// Add WHERE clause if filters are provided
+	if len(result.Conditions) > 0 {
+		logicalOperator := filter.LogicalAnd
+		if filters != nil {
+			logicalOperator = filters.LogicalOperator
+		}
+		baseQuery += " WHERE " + filter.BuildConditionExpression(result.Conditions, logicalOperator)
+	}
+
+	// Add ORDER BY clause
+	baseQuery += " ORDER BY " + result.OrderBy
+
+	// Add pagination
+	baseQuery += fmt.Sprintf(" LIMIT $%d OFFSET $%d", argPos, argPos+1)
+	args = append(args, limit, offset)
+
+	rows, err := d.Conn.QueryContext(ctx, baseQuery, args...)
+	if err != nil {
+		return nil, nil, apierror.NewAPIError(apierror.ErrInternalServer, "Failed to retrieve ledgers", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	ledgers := []model.Ledger{}
+	var totalCount *int64
+
+	for rows.Next() {
+		ledger := model.Ledger{}
+		var metaDataJSON []byte
+
+		if opts != nil && opts.IncludeCount {
+			var count int64
+			err = rows.Scan(&ledger.LedgerID, &ledger.Name, &ledger.CreatedAt, &metaDataJSON, &count)
+			if totalCount == nil {
+				totalCount = &count
+			}
+		} else {
+			err = rows.Scan(&ledger.LedgerID, &ledger.Name, &ledger.CreatedAt, &metaDataJSON)
+		}
+		if err != nil {
+			return nil, nil, apierror.NewAPIError(apierror.ErrInternalServer, "Failed to scan ledger data", err)
+		}
+
+		err = json.Unmarshal(metaDataJSON, &ledger.MetaData)
+		if err != nil {
+			return nil, nil, apierror.NewAPIError(apierror.ErrInternalServer, "Failed to unmarshal metadata", err)
+		}
+
+		ledgers = append(ledgers, ledger)
+	}
+
+	if err = rows.Err(); err != nil {
+		return nil, nil, apierror.NewAPIError(apierror.ErrInternalServer, "Error occurred while iterating over ledgers", err)
+	}
+
+	return ledgers, totalCount, nil
+}

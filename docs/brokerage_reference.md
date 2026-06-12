@@ -353,3 +353,189 @@ Blnk (см. ниже).
 - Маршрутизация EGAR/НТО/BCC и оркестрация (Camunda) — это слой TradeControl.
 - Потребление лотов FIFO/LIFO при продаже — не моделируется; авторитетной
   средней служит `wa_price` на балансе (продажа её не меняет).
+
+---
+
+## 11. Диаграммы
+
+### 11.1. Схема данных (ER)
+
+```mermaid
+erDiagram
+    LEDGERS ||--o{ BALANCES : "ledger_id"
+    BALANCES ||--o{ BALANCE_LOTS : "balance_id"
+
+    LEDGERS {
+        text ledger_id PK
+        text name
+    }
+    BALANCES {
+        text balance_id PK
+        text ledger_id FK
+        text identity_id
+        text account_ref "счёт; NULL = родной баланс Blnk"
+        text instrument "NULL = деньги, задан = бумаги"
+        date settle_date "NULL = спот; идентичность будущей позиции"
+        int  settle_code "T+N, справочный, может быть NULL"
+        numeric wa_price "средневзвешенная цена"
+        numeric balance "= credit - debit (settled)"
+        numeric credit_balance
+        numeric debit_balance
+        numeric inflight_credit_balance "приход в пути (waiting)"
+        numeric inflight_debit_balance "блокировка (blocked)"
+        bigint version "оптимистическая блокировка"
+        text currency
+    }
+    BALANCE_LOTS {
+        text lot_id PK
+        text balance_id FK
+        text instrument
+        numeric quantity "minor units"
+        bigint precision
+        numeric price "за единицу"
+        text currency
+        text reference
+        timestamp purchased_at
+    }
+    INSTRUMENT_SETTINGS {
+        text instrument PK
+        text venue
+        bool trades_on_the_way "учитывать ли в пути"
+        int  settle_offset "T+N по умолчанию"
+    }
+    MARKET_HOLIDAYS {
+        bigint id PK
+        text venue
+        date holiday_date
+    }
+```
+
+> `INSTRUMENT_SETTINGS` и `MARKET_HOLIDAYS` связаны с позициями логически
+> (через `instrument` и `venue`), без внешних ключей: это справочники режима
+> и календаря, читаемые сервисом при букинге/расчёте.
+
+### 11.2. Уникальный ключ позиции
+
+```mermaid
+flowchart LR
+    K["Идентичность позиции<br/>(уникальный индекс,<br/>account_ref IS NOT NULL)"]
+    K --> L[ledger_id]
+    K --> I["COALESCE(identity_id,'')"]
+    K --> A[account_ref]
+    K --> N["COALESCE(instrument,'')<br/>'' = деньги"]
+    K --> C[currency]
+    K --> D["COALESCE(settle_date,'1970-01-01')<br/>'1970-01-01' = спот"]
+```
+
+### 11.3. Покупка — `BookTrade`
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant API as API /brokerage/trades
+    participant S as Blnk (service)
+    participant DB as Datasource / PostgreSQL
+
+    API->>S: BookTrade(booking)
+    S->>DB: GetInstrumentSettings(instrument)
+    Note over S: режим + T+N (или явная settle_date)
+    S->>DB: GetHolidays(venue) → ComputeSettleDate
+    S->>DB: FindOrCreatePosition(деньги счёта, спот)
+    S->>DB: FindOrCreatePosition(бумага, settle_date) [future]
+    S->>S: money = price × quantity
+    S->>DB: RecordTransaction(money: client_money→settlement, INFLIGHT)
+    Note over DB: client_money.inflight_debit += сумма (блокировка)
+    S->>DB: RecordTransaction(security: market→future, INFLIGHT, overdraft)
+    Note over DB: future.inflight_credit += кол-во (приход в пути)
+    alt сбой бумажного лега
+        S->>DB: VoidInflightTransaction(money) — компенсация
+    end
+    S-->>API: TradeBookingResult (txn ids, future balance, settle_date)
+```
+
+### 11.4. Продажа — `SellTrade` (с проверкой доступности)
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant API as API /brokerage/sell-trades
+    participant S as Blnk (service)
+    participant DB as Datasource / PostgreSQL
+
+    API->>S: SellTrade(booking)
+    S->>DB: GetInstrumentSettings + ComputeSettleDate
+    S->>S: GetTradablePosition(settle_date)
+    S->>DB: GetPosition(спот) → settled, blocked
+    alt on_the_way
+        S->>DB: SumFutureHolds(≤ settle_date) → incoming, outgoing
+        Note over S: tradable = settled − blocked + incoming − outgoing
+    else immediate
+        Note over S: tradable = settled − blocked
+    end
+    alt quantity > tradable
+        S-->>API: 400 insufficient tradable (без букинга)
+    else quantity ≤ tradable
+        S->>DB: RecordTransaction(money: settlement→client_money, INFLIGHT, overdraft)
+        Note over DB: client_money.inflight_credit += выручка
+        S->>DB: RecordTransaction(security: future→market, INFLIGHT, overdraft)
+        Note over DB: future.inflight_debit += кол-во (расход в пути)
+        S-->>API: SellBookingResult (+ снимок tradable)
+    end
+```
+
+### 11.5. Расчёт — `RunSettlement` / `settleFutureBalance` (net-roll)
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant API as API /brokerage/settlements/run
+    participant S as Blnk (service)
+    participant DB as Datasource / PostgreSQL
+
+    API->>S: RunSettlement(asOf)
+    S->>DB: GetMaturedPositions(settle_date ≤ asOf)
+    loop по каждой созревшей позиции
+        S->>DB: GetPendingInflightByBalance(future)
+        Note over S: разделить леги: покупки, затем продажи
+        loop покупки → продажи
+            S->>DB: CommitInflightTransaction(money leg)
+            S->>DB: CommitInflightTransaction(security leg)
+            opt покупка
+                S->>S: RecalculateWAPrice (HALF_EVEN, scale 2)
+                S->>DB: UpdateWAPrice + CreateLot
+            end
+        end
+        Note over S: net = future.balance (= credit − debit)
+        alt net > 0 (нетто-приход)
+            S->>DB: RecordTransaction(future→spot, net)
+        else net < 0 (нетто-расход)
+            S->>DB: RecordTransaction(spot→future, |net|, overdraft)
+        end
+        Note over DB: future → 0; spot сдвигается на net
+    end
+    S-->>API: SettlementRunResult (settled / errors по позициям)
+```
+
+### 11.6. Поток величин по балансам (от букинга к расчёту)
+
+```mermaid
+flowchart TB
+    subgraph Букинг
+        B1["Покупка 50 @180 T+2"] --> F1["future(T+2).inflight_credit = 50"]
+        B2["Продажа 125 @185 T+2"] --> F2["future(T+2).inflight_debit = 125"]
+        B0["Старт"] --> SP0["spot.balance = 100, WA = 150"]
+    end
+    subgraph Доступность
+        F1 --> TR["tradable = 100 − 0 + 50 − 0 = 150<br/>продажа 125 ≤ 150 ✓"]
+        SP0 --> TR
+    end
+    subgraph Расчёт_T2["Расчёт (T+2)"]
+        F1 --> C1["commit покупки → +50, WA = (100·150+50·180)/150 = 160"]
+        F2 --> C2["commit продажи → −125"]
+        C1 --> NET["net = 50 − 125 = −75"]
+        C2 --> NET
+        NET --> ROLL["spot → future 75 (обнуление future)"]
+        ROLL --> FIN["spot.balance = 25 @ WA 160.00"]
+    end
+```
+
